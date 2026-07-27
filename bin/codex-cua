@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+"""codex-cua: drive local macOS apps through Codex Computer Use from the shell.
+
+Codex ships Computer Use as an MCP server (`SkyComputerUseClient mcp`), but the
+service refuses connections whose parent/responsible process is not signed by
+OpenAI's team id, so spawning it from a shell fails with
+"Sender process is not authenticated". This CLI therefore runs it the way Codex
+does: `codex app-server` hosts the MCP server and we call tools through
+`mcpServer/tool/call`.
+
+A background session daemon keeps one app-server + thread alive so repeated
+commands cost well under a second instead of re-paying app-server startup.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+VERSION = "0.1.0"
+SERVER_NAME = "computer-use"
+DEFAULT_TIMEOUT = 180.0
+
+TOOLS = {
+    "list_apps": (),
+    "get_app_state": ("app",),
+    "click": ("app",),
+    "perform_secondary_action": ("app", "element_index", "action"),
+    "set_value": ("app", "element_index", "value"),
+    "select_text": ("app", "element_index", "text"),
+    "scroll": ("app", "direction", "element_index"),
+    "drag": ("app", "from_x", "from_y", "to_x", "to_y"),
+    "press_key": ("app", "key"),
+    "type_text": ("app", "text"),
+}
+
+# Tools that need an app-use session, i.e. a get_app_state for that app first.
+INTERACTION_TOOLS = {
+    "click",
+    "perform_secondary_action",
+    "set_value",
+    "select_text",
+    "scroll",
+    "drag",
+    "press_key",
+    "type_text",
+}
+
+
+def tree_matches(text: str, pattern: str, case_sensitive: bool = False) -> list[tuple[str, str]]:
+    """Return (element_index, line) for accessibility-tree lines matching pattern."""
+    try:
+        compiled = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+    except re.error as exc:
+        raise SystemExit(f"bad pattern: {exc}")
+    matches = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not compiled.search(stripped):
+            continue
+        index = stripped.split(" ", 1)[0]
+        if index.isdigit():
+            matches.append((index, stripped))
+    return matches
+
+
+def state_dir() -> Path:
+    root = Path(os.environ.get("CODEX_CUA_HOME") or (Path.home() / ".cache" / "codex-cua"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def codex_bin() -> str:
+    explicit = os.environ.get("CODEX_BIN")
+    if explicit:
+        return explicit
+    candidates = [
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+        str(Path.home() / ".codex" / "bin" / "codex"),
+    ]
+    found = shutil.which("codex")
+    if found:
+        candidates.append(found)
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    raise SystemExit(
+        "codex CLI not found. Install the Codex/ChatGPT desktop app or set CODEX_BIN."
+    )
+
+
+def computer_use_app() -> Path:
+    explicit = os.environ.get("CODEX_CUA_APP")
+    if explicit:
+        return Path(explicit)
+    candidates = [
+        Path.home() / ".codex" / "computer-use" / "Codex Computer Use.app",
+        Path.home()
+        / ".codex"
+        / "plugins"
+        / "openai-bundled"
+        / "plugins"
+        / "computer-use"
+        / "Codex Computer Use.app",
+        Path("/Applications/ChatGPT.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"),
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    raise SystemExit(
+        "Codex Computer Use.app not found. Enable Computer Use in the Codex app, "
+        "or set CODEX_CUA_APP to the bundle path."
+    )
+
+
+def mcp_client_path(app: Path) -> Path:
+    return app / "Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+
+
+class AppServer:
+    """Speaks the Codex app-server JSON-RPC protocol over stdio."""
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.proc: subprocess.Popen | None = None
+        self.inbox: queue.Queue = queue.Queue()
+        self.next_id = 0
+        self.thread_id: str | None = None
+        self.lock = threading.Lock()
+
+    def start(self) -> None:
+        app = computer_use_app()
+        client = mcp_client_path(app)
+        if not client.is_file():
+            raise SystemExit(f"Computer Use MCP client missing at {client}")
+        args = [
+            codex_bin(),
+            "app-server",
+            "--stdio",
+            "-c",
+            f"mcp_servers.{SERVER_NAME}.enabled=true",
+            "-c",
+            f"mcp_servers.{SERVER_NAME}.command={json.dumps(str(client))}",
+            "-c",
+            f'mcp_servers.{SERVER_NAME}.args=["mcp"]',
+            "-c",
+            f"mcp_servers.{SERVER_NAME}.cwd={json.dumps(str(app.parent))}",
+            "-c",
+            f"mcp_servers.{SERVER_NAME}.startup_timeout_sec=60",
+        ]
+        self.proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+        self.request(
+            "initialize",
+            {
+                "clientInfo": {"name": "codex-cua", "version": VERSION},
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        self.notify("initialized")
+        started = self.request(
+            "thread/start",
+            {"cwd": os.getcwd(), "ephemeral": True, "serviceName": "codex-cua"},
+        )
+        self.thread_id = (started.get("thread") or {}).get("id")
+        if not self.thread_id:
+            raise SystemExit("app-server thread/start returned no thread id")
+
+    def _read_stdout(self) -> None:
+        assert self.proc and self.proc.stdout
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                self.inbox.put(json.loads(line))
+            except json.JSONDecodeError:
+                if self.verbose:
+                    print(f"app-server: {line[:400]}", file=sys.stderr)
+
+    def _read_stderr(self) -> None:
+        assert self.proc and self.proc.stderr
+        for line in self.proc.stderr:
+            if self.verbose:
+                print(f"app-server stderr: {line.rstrip()}", file=sys.stderr)
+
+    def _write(self, message: dict) -> None:
+        assert self.proc and self.proc.stdin
+        self.proc.stdin.write(json.dumps(message) + "\n")
+        self.proc.stdin.flush()
+
+    def notify(self, method: str, params: dict | None = None) -> None:
+        self._write({"method": method, "params": params or {}})
+
+    def request(self, method: str, params: dict | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict:
+        with self.lock:
+            self.next_id += 1
+            rid = self.next_id
+            self._write({"id": rid, "method": method, "params": params or {}})
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if self.proc and self.proc.poll() is not None:
+                    raise SystemExit(f"codex app-server exited with code {self.proc.returncode}")
+                try:
+                    message = self.inbox.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if message.get("id") == rid and ("result" in message or "error" in message):
+                    if "error" in message:
+                        raise RuntimeError(json.dumps(message["error"]))
+                    return message["result"]
+                if message.get("method") and message.get("id") is not None:
+                    # Server-initiated request; acknowledge so it does not block.
+                    self._write({"id": message["id"], "result": {}})
+            raise TimeoutError(f"{method} timed out after {timeout:.0f}s")
+
+    def call_tool(self, tool: str, arguments: dict, timeout: float = DEFAULT_TIMEOUT) -> dict:
+        return self.request(
+            "mcpServer/tool/call",
+            {
+                "threadId": self.thread_id,
+                "server": SERVER_NAME,
+                "tool": tool,
+                "arguments": arguments,
+            },
+            timeout=timeout,
+        )
+
+    def stop(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+def execute(server: AppServer, primed: set[str], payload: dict) -> dict:
+    """Run one tool call, priming the app session and resolving --match first."""
+    tool = payload["tool"]
+    arguments = dict(payload.get("arguments") or {})
+    timeout = float(payload.get("timeout") or DEFAULT_TIMEOUT)
+    app = arguments.get("app")
+    match = payload.get("match")
+
+    needs_state = bool(match) or (
+        payload.get("prime", True) and tool in INTERACTION_TOOLS and app and app not in primed
+    )
+    if needs_state and app:
+        state = server.call_tool("get_app_state", {"app": app}, timeout=timeout)
+        primed.add(app)
+        if match:
+            text = result_text(state)
+            found = tree_matches(text, match["pattern"], match.get("case_sensitive", False))
+            if not found:
+                raise RuntimeError(f"no element in {app} matches {match['pattern']!r}")
+            if len(found) > 1 and not match.get("first", False):
+                listing = "\n".join(f"  {i}\t{l}" for i, l in found[:10])
+                raise RuntimeError(
+                    f"{len(found)} elements match {match['pattern']!r}; refine it or pass --first:\n{listing}"
+                )
+            arguments["element_index"] = found[0][0]
+    if tool == "get_app_state" and app:
+        primed.add(app)
+    return server.call_tool(tool, arguments, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Session daemon
+# ---------------------------------------------------------------------------
+
+SOCKET_PATH = state_dir() / "session.sock"
+PID_PATH = state_dir() / "session.pid"
+LOG_PATH = state_dir() / "session.log"
+
+
+def daemon_alive() -> bool:
+    if not SOCKET_PATH.exists():
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            sock.connect(str(SOCKET_PATH))
+        return True
+    except OSError:
+        return False
+
+
+def daemon_send(payload: dict, timeout: float) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout + 15)
+        sock.connect(str(SOCKET_PATH))
+        sock.sendall((json.dumps(payload) + "\n").encode())
+        chunks = []
+        while True:
+            data = sock.recv(1 << 20)
+            if not data:
+                break
+            chunks.append(data)
+            if chunks[-1].endswith(b"\n"):
+                break
+    return json.loads(b"".join(chunks).decode())
+
+
+def run_daemon(verbose: bool) -> None:
+    server = AppServer(verbose=verbose)
+    server.start()
+    primed: set[str] = set()
+
+    if SOCKET_PATH.exists():
+        SOCKET_PATH.unlink()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(SOCKET_PATH))
+    listener.listen(8)
+    PID_PATH.write_text(str(os.getpid()))
+
+    def shutdown(*_args):
+        server.stop()
+        for path in (SOCKET_PATH, PID_PATH):
+            path.unlink(missing_ok=True)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    while True:
+        conn, _ = listener.accept()
+        with conn:
+            buf = b""
+            while not buf.endswith(b"\n"):
+                data = conn.recv(1 << 16)
+                if not data:
+                    break
+                buf += data
+            if not buf.strip():
+                continue
+            try:
+                payload = json.loads(buf.decode())
+                if payload.get("op") == "ping":
+                    reply = {"ok": True, "thread": server.thread_id, "pid": os.getpid()}
+                elif payload.get("op") == "shutdown":
+                    conn.sendall(b'{"ok": true}\n')
+                    shutdown()
+                    return
+                else:
+                    reply = {"ok": True, "result": execute(server, primed, payload)}
+            except Exception as exc:  # noqa: BLE001 - report every failure to the client
+                message = str(exc) if isinstance(exc, (RuntimeError, SystemExit)) else f"{type(exc).__name__}: {exc}"
+                reply = {"ok": False, "error": message}
+            conn.sendall((json.dumps(reply) + "\n").encode())
+
+
+def ensure_daemon(verbose: bool) -> None:
+    if daemon_alive():
+        return
+    SOCKET_PATH.unlink(missing_ok=True)
+    log = open(LOG_PATH, "ab")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "daemon", "run"] + (["--verbose"] if verbose else []),
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+    )
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if daemon_alive():
+            return
+        time.sleep(0.2)
+    raise SystemExit(f"session daemon failed to start; see {LOG_PATH}")
+
+
+# ---------------------------------------------------------------------------
+# Tool invocation
+# ---------------------------------------------------------------------------
+
+
+def invoke(tool: str, arguments: dict, opts: argparse.Namespace) -> dict:
+    arguments = {k: v for k, v in arguments.items() if v is not None}
+    timeout = float(getattr(opts, "timeout", DEFAULT_TIMEOUT))
+    payload = {
+        "tool": tool,
+        "arguments": arguments,
+        "timeout": timeout,
+        "prime": not getattr(opts, "no_prime", False),
+    }
+    pattern = getattr(opts, "match", None)
+    if pattern:
+        payload["match"] = {
+            "pattern": pattern,
+            "case_sensitive": getattr(opts, "case_sensitive", False),
+            "first": getattr(opts, "first", False),
+        }
+    if getattr(opts, "no_daemon", False):
+        server = AppServer(verbose=opts.verbose)
+        server.start()
+        try:
+            return execute(server, set(), payload)
+        finally:
+            server.stop()
+    ensure_daemon(opts.verbose)
+    reply = daemon_send(payload, timeout)
+    if not reply.get("ok"):
+        raise SystemExit(reply.get("error", "unknown session daemon error"))
+    return reply["result"]
+
+
+def result_text(result: dict) -> str:
+    return "\n".join(
+        block.get("text", "")
+        for block in (result.get("content") or [])
+        if block.get("type") == "text"
+    )
+
+
+def result_images(result: dict) -> list[bytes]:
+    return [
+        base64.b64decode(block["data"])
+        for block in (result.get("content") or [])
+        if block.get("type") == "image" and block.get("data")
+    ]
+
+
+def emit(result: dict, opts: argparse.Namespace, *, print_text: bool = True) -> int:
+    if getattr(opts, "quiet", False):
+        print_text = False
+    if getattr(opts, "json", False):
+        print(json.dumps(result, indent=2))
+    elif print_text:
+        text = result_text(result)
+        if text:
+            print(text)
+    out = getattr(opts, "out", None)
+    images = result_images(result)
+    if out and images:
+        target = Path(out)
+        if target.is_dir() or out.endswith("/"):
+            target.mkdir(parents=True, exist_ok=True)
+            paths = [target / f"screenshot-{i}.png" if i else target / "screenshot.png" for i in range(len(images))]
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            paths = [target if i == 0 else target.with_name(f"{target.stem}-{i}{target.suffix}") for i in range(len(images))]
+        for path, data in zip(paths, images):
+            path.write_bytes(data)
+            print(f"screenshot: {path}", file=sys.stderr)
+    elif images and not getattr(opts, "quiet", False):
+        print(f"({len(images)} screenshot(s) returned; pass --out FILE to save)", file=sys.stderr)
+    return 1 if result.get("isError") else 0
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_apps(opts):
+    return emit(invoke("list_apps", {}, opts), opts)
+
+
+def cmd_state(opts):
+    return emit(invoke("get_app_state", {"app": opts.app}, opts), opts)
+
+
+def cmd_find(opts):
+    result = invoke("get_app_state", {"app": opts.app}, opts)
+    matches = tree_matches(result_text(result), opts.pattern, opts.case_sensitive)
+    if opts.json:
+        print(json.dumps([{"element_index": i, "line": l} for i, l in matches], indent=2))
+    else:
+        for index, line in matches:
+            print(f"{index}\t{line}")
+    if not matches:
+        print(f"no elements matching {opts.pattern!r}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_screenshot(opts):
+    result = invoke("get_app_state", {"app": opts.app}, opts)
+    return emit(result, opts, print_text=False)
+
+
+def require_target(opts, command: str) -> None:
+    if not opts.element and not opts.match:
+        raise SystemExit(f"{command} needs --element INDEX or --match REGEX")
+    if opts.element and opts.match:
+        raise SystemExit("--element and --match are mutually exclusive")
+
+
+def cmd_click(opts):
+    if opts.element is None and opts.match is None and (opts.x is None or opts.y is None):
+        raise SystemExit("click needs --element INDEX, --match REGEX, or both --x and --y")
+    args = {
+        "app": opts.app,
+        "element_index": opts.element,
+        "x": opts.x,
+        "y": opts.y,
+        "click_count": opts.count,
+        "mouse_button": opts.button,
+    }
+    return emit(invoke("click", args, opts), opts)
+
+
+def cmd_type(opts):
+    return emit(invoke("type_text", {"app": opts.app, "text": opts.text}, opts), opts)
+
+
+def cmd_key(opts):
+    return emit(invoke("press_key", {"app": opts.app, "key": opts.key}, opts), opts)
+
+
+def cmd_scroll(opts):
+    require_target(opts, "scroll")
+    args = {
+        "app": opts.app,
+        "element_index": opts.element,
+        "direction": opts.direction,
+        "pages": opts.pages,
+    }
+    return emit(invoke("scroll", args, opts), opts)
+
+
+def parse_point(value: str, flag: str) -> tuple[float, float]:
+    parts = value.replace(" ", "").split(",")
+    if len(parts) != 2:
+        raise SystemExit(f"{flag} expects X,Y")
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
+        raise SystemExit(f"{flag} expects numeric X,Y")
+
+
+def cmd_drag(opts):
+    fx, fy = parse_point(opts.start, "--from")
+    tx, ty = parse_point(opts.end, "--to")
+    args = {"app": opts.app, "from_x": fx, "from_y": fy, "to_x": tx, "to_y": ty}
+    return emit(invoke("drag", args, opts), opts)
+
+
+def cmd_set_value(opts):
+    require_target(opts, "set-value")
+    args = {"app": opts.app, "element_index": opts.element, "value": opts.value}
+    return emit(invoke("set_value", args, opts), opts)
+
+
+def cmd_select_text(opts):
+    require_target(opts, "select-text")
+    args = {
+        "app": opts.app,
+        "element_index": opts.element,
+        "text": opts.text,
+        "prefix": opts.prefix,
+        "suffix": opts.suffix,
+        "selection": opts.selection,
+    }
+    return emit(invoke("select_text", args, opts), opts)
+
+
+def cmd_action(opts):
+    require_target(opts, "action")
+    args = {"app": opts.app, "element_index": opts.element, "action": opts.action}
+    return emit(invoke("perform_secondary_action", args, opts), opts)
+
+
+def cmd_call(opts):
+    if opts.tool not in TOOLS:
+        raise SystemExit(f"unknown tool {opts.tool!r}; known tools: {', '.join(sorted(TOOLS))}")
+    try:
+        arguments = json.loads(opts.arguments) if opts.arguments else {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"arguments must be JSON: {exc}")
+    missing = [k for k in TOOLS[opts.tool] if k not in arguments]
+    if missing:
+        raise SystemExit(f"{opts.tool} requires: {', '.join(missing)}")
+    return emit(invoke(opts.tool, arguments, opts), opts)
+
+
+def cmd_tools(opts):
+    for name, required in sorted(TOOLS.items()):
+        print(f"{name}\trequired: {', '.join(required) or '(none)'}")
+    return 0
+
+
+def cmd_daemon(opts):
+    if opts.action == "run":
+        run_daemon(opts.verbose)
+        return 0
+    if opts.action == "start":
+        ensure_daemon(opts.verbose)
+        print(f"session daemon running (pid {PID_PATH.read_text().strip()}), socket {SOCKET_PATH}")
+        return 0
+    if opts.action == "status":
+        if daemon_alive():
+            info = daemon_send({"op": "ping"}, 10)
+            print(json.dumps(info, indent=2))
+            return 0
+        print("session daemon not running")
+        return 1
+    if opts.action == "stop":
+        if not daemon_alive():
+            print("session daemon not running")
+            return 0
+        try:
+            daemon_send({"op": "shutdown"}, 10)
+        except OSError:
+            pass
+        SOCKET_PATH.unlink(missing_ok=True)
+        PID_PATH.unlink(missing_ok=True)
+        print("session daemon stopped")
+        return 0
+    if opts.action == "restart":
+        opts.action = "stop"
+        cmd_daemon(opts)
+        opts.action = "start"
+        return cmd_daemon(opts)
+    raise SystemExit(f"unknown daemon action {opts.action}")
+
+
+def cmd_doctor(opts):
+    ok = True
+
+    def check(label: str, good: bool, detail: str) -> None:
+        nonlocal ok
+        ok = ok and good
+        print(f"{'pass' if good else 'FAIL'}  {label}: {detail}")
+
+    try:
+        codex = codex_bin()
+        check("codex CLI", True, codex)
+    except SystemExit as exc:
+        check("codex CLI", False, str(exc))
+        codex = None
+
+    if codex:
+        try:
+            signing = subprocess.run(
+                ["codesign", "-dv", "--verbose=2", codex],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            ).stderr
+            team = next((l.split("=", 1)[1] for l in signing.splitlines() if l.startswith("TeamIdentifier=")), "")
+            check(
+                "codex signed by OpenAI",
+                team == "2DC432GLL2",
+                team or "no team identifier (Computer Use will reject this host process)",
+            )
+        except Exception as exc:  # noqa: BLE001
+            check("codex signature", False, str(exc))
+
+    try:
+        app = computer_use_app()
+        check("Computer Use bundle", True, str(app))
+        client = mcp_client_path(app)
+        check("MCP client binary", client.is_file(), str(client))
+    except SystemExit as exc:
+        check("Computer Use bundle", False, str(exc))
+
+    print(f"info  session daemon: {SOCKET_PATH if daemon_alive() else 'not running (starts on demand)'}")
+
+    if ok:
+        try:
+            result = invoke("list_apps", {}, opts)
+            lines = [l for l in result_text(result).splitlines() if l.strip()]
+            check("list_apps", not result.get("isError"), f"{len(lines)} apps visible")
+        except Exception as exc:  # noqa: BLE001
+            check("list_apps", False, str(exc))
+            ok = False
+
+    if not ok:
+        print(
+            "\nIf list_apps reports 'Sender process is not authenticated', the Computer Use "
+            "service rejected the host process. Only an OpenAI-signed parent (the codex CLI) "
+            "may host the MCP server, so make sure CODEX_BIN points at the bundled binary.",
+            file=sys.stderr,
+        )
+    return 0 if ok else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-cua",
+        description="Drive local macOS apps through Codex Computer Use.",
+    )
+    parser.add_argument("--version", action="version", version=VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="print the raw MCP result")
+    common.add_argument("--out", help="write returned screenshots to this file or directory")
+    common.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="per-tool timeout in seconds")
+    common.add_argument("--no-daemon", action="store_true", help="run a throwaway app-server instead of the session daemon")
+    common.add_argument("--no-prime", action="store_true", help="skip the automatic get_app_state before an interaction")
+    common.add_argument("--quiet", "-q", action="store_true", help="suppress tree output, keep --out screenshots")
+    common.add_argument("--verbose", "-v", action="store_true", help="log app-server output")
+
+    # Element selection. Indices are only valid inside one snapshot, so --match
+    # resolves against a fresh tree in the same round trip.
+    target = argparse.ArgumentParser(add_help=False)
+    target.add_argument("--element", "-e", help="element index from the accessibility tree")
+    target.add_argument("--match", "-m", help="regex matched against tree lines to pick the element")
+    target.add_argument("--case-sensitive", action="store_true", help="make --match case sensitive")
+    target.add_argument("--first", action="store_true", help="use the first --match hit instead of failing on ambiguity")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("apps", parents=[common], help="list running and recent apps")
+    p.set_defaults(func=cmd_apps)
+
+    p = sub.add_parser("state", parents=[common], help="accessibility tree + screenshot for an app")
+    p.add_argument("app")
+    p.set_defaults(func=cmd_state)
+
+    p = sub.add_parser("find", parents=[common], help="grep the accessibility tree for element indices")
+    p.add_argument("app")
+    p.add_argument("pattern")
+    p.add_argument("--case-sensitive", action="store_true")
+    p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser("screenshot", parents=[common], help="save a screenshot of the app's key window")
+    p.add_argument("app")
+    p.set_defaults(func=cmd_screenshot)
+
+    p = sub.add_parser("click", parents=[common, target], help="click an element or pixel coordinate")
+    p.add_argument("app")
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.add_argument("--count", type=int, help="number of clicks")
+    p.add_argument("--button", choices=["left", "right", "middle"])
+    p.set_defaults(func=cmd_click)
+
+    p = sub.add_parser("type", parents=[common], help="type literal text")
+    p.add_argument("app")
+    p.add_argument("text")
+    p.set_defaults(func=cmd_type)
+
+    p = sub.add_parser("key", parents=[common], help="press a key or chord (xdotool syntax, e.g. super+c)")
+    p.add_argument("app")
+    p.add_argument("key")
+    p.set_defaults(func=cmd_key)
+
+    p = sub.add_parser("scroll", parents=[common, target], help="scroll an element")
+    p.add_argument("app")
+    p.add_argument("--direction", "-d", required=True, choices=["up", "down", "left", "right"])
+    p.add_argument("--pages", type=float)
+    p.set_defaults(func=cmd_scroll)
+
+    p = sub.add_parser("drag", parents=[common], help="drag between two pixel coordinates")
+    p.add_argument("app")
+    p.add_argument("--from", dest="start", required=True, metavar="X,Y")
+    p.add_argument("--to", dest="end", required=True, metavar="X,Y")
+    p.set_defaults(func=cmd_drag)
+
+    p = sub.add_parser("set-value", parents=[common, target], help="set a settable element's value")
+    p.add_argument("app")
+    p.add_argument("value")
+    p.set_defaults(func=cmd_set_value)
+
+    p = sub.add_parser("select-text", parents=[common, target], help="select text or place the cursor in a text element")
+    p.add_argument("app")
+    p.add_argument("text")
+    p.add_argument("--prefix")
+    p.add_argument("--suffix")
+    p.add_argument("--selection", choices=["text", "cursor_before", "cursor_after"])
+    p.set_defaults(func=cmd_select_text)
+
+    p = sub.add_parser("action", parents=[common, target], help="invoke a secondary accessibility action")
+    p.add_argument("app")
+    p.add_argument("action")
+    p.set_defaults(func=cmd_action)
+
+    p = sub.add_parser("call", parents=[common], help="call any Computer Use tool with raw JSON arguments")
+    p.add_argument("tool")
+    p.add_argument("arguments", nargs="?", default="{}")
+    p.set_defaults(func=cmd_call)
+
+    p = sub.add_parser("tools", parents=[common], help="list the Computer Use tools and their required arguments")
+    p.set_defaults(func=cmd_tools)
+
+    p = sub.add_parser("daemon", parents=[common], help="manage the background session daemon")
+    p.add_argument("action", choices=["start", "stop", "restart", "status", "run"])
+    p.set_defaults(func=cmd_daemon)
+
+    p = sub.add_parser("doctor", parents=[common], help="check the Computer Use setup end to end")
+    p.set_defaults(func=cmd_doctor)
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    if sys.platform != "darwin":
+        raise SystemExit("codex-cua only works on macOS")
+    opts = build_parser().parse_args(argv)
+    try:
+        return opts.func(opts)
+    except KeyboardInterrupt:
+        return 130
+    except (RuntimeError, TimeoutError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
