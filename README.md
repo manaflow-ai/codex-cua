@@ -93,6 +93,12 @@ codex-cua daemon restart
 codex-cua daemon stop      # logs in ~/.cache/codex-cua/session.log
 ```
 
+The daemon endpoint is a random Unix socket inside a mode `0700` session directory. A mode `0600` token file and a mutual per-connection challenge response authenticate the daemon and every request, including `status` and `stop`. macOS peer credentials and the audit token are checked before the request is read. The endpoint, PID, log, and lock files are opened without following symlinks and are kept mode `0600`.
+
+The normal Python CLI is unsigned, so the default policy requires the current user and the kernel audit-token/PID match. Managed installations can require a code-signing team with `CODEX_CUA_ALLOWED_TEAM_IDS=TEAMID[,TEAMID...]`; `CODEX_CUA_REQUIRE_TEAM_ID=1` also rejects unsigned clients. Team checks use Security.framework when macOS provides it and fail closed when strict mode is enabled.
+
+Versions before `0.2.0` used `session.sock` without authentication. This version never connects to that legacy socket. Stop an old process with the old binary, then remove its stale socket after checking the path; a new command starts an isolated v2 session automatically.
+
 `--no-daemon` runs a throwaway app-server instead, about 5 seconds per command and no residue.
 
 ## Scripting example
@@ -118,6 +124,8 @@ Tree and coordinate parsing are covered. Everything else needs a live app, so ve
 ## Limits
 
 macOS only. Computer Use has to be installed and permitted through the Codex or ChatGPT desktop app, and this repo ships none of it. The tools, the service, and its authentication rules belong to OpenAI and can change without notice. Not affiliated with or endorsed by OpenAI.
+
+The token and Unix-socket permissions protect against other users and accidental local callers. A process that already has the same user account's full local access can read the token or impersonate an unsigned CLI, so use `CODEX_CUA_ALLOWED_TEAM_IDS` and `CODEX_CUA_REQUIRE_TEAM_ID` for a stronger managed boundary. Security.framework resolves a peer's team by PID after the kernel supplied audit-token check; a PID can be reused after a peer exits, so team identity is an additional policy check, not a replacement for the challenge or peer credentials.
 
 ## License
 

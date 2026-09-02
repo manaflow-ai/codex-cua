@@ -16,22 +16,39 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import fcntl
+import hashlib
+import hmac
 import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import signal
 import socket
+import stat
+import struct
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SERVER_NAME = "computer-use"
 DEFAULT_TIMEOUT = 180.0
+IPC_VERSION = 2
+IPC_AUTH_TIMEOUT = 5.0
+IPC_MAX_FRAME = 1 << 20
+IPC_MAX_TIMEOUT = 600.0
+IPC_MAX_MATCH_PATTERN = 4096
+UNIX_SOCKET_PATH_MAX = 104
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+OPENAI_TEAM_ID = "2DC432GLL2"
 
 TOOLS = {
     "list_apps": (),
@@ -74,12 +91,6 @@ def tree_matches(text: str, pattern: str, case_sensitive: bool = False) -> list[
         if index.isdigit():
             matches.append((index, stripped))
     return matches
-
-
-def state_dir() -> Path:
-    root = Path(os.environ.get("CODEX_CUA_HOME") or (Path.home() / ".cache" / "codex-cua"))
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def codex_bin() -> str:
@@ -127,6 +138,433 @@ def computer_use_app() -> Path:
 
 def mcp_client_path(app: Path) -> Path:
     return app / "Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+
+
+class IPCError(RuntimeError):
+    """A local session protocol or peer-authentication failure."""
+
+
+class PeerAuthenticationError(IPCError):
+    """The kernel or protocol did not authenticate an IPC peer."""
+
+
+class PeerIdentity(NamedTuple):
+    """Identity facts obtained from the kernel, not from request JSON."""
+
+    uid: int
+    pid: int | None
+    audit_uid: int | None
+    audit_pid: int | None
+    team_id: str | None
+    identifier: str | None
+
+
+class SessionInfo(NamedTuple):
+    """The authenticated endpoint metadata for one daemon session."""
+
+    endpoint: Path
+    session_dir: Path
+    socket_path: Path
+    auth_path: Path
+    pid: int
+    token: bytes
+
+
+def _private_stat(path: Path, *, directory: bool) -> os.stat_result:
+    """Return a safe lstat result, rejecting symlinks and foreign owners."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise IPCError(f"private {'directory' if directory else 'file'} is missing: {path}")
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(info.st_mode):
+        raise IPCError(f"private path is not a {'directory' if directory else 'regular file'}: {path}")
+    if info.st_uid != os.getuid():
+        raise IPCError(f"private path has unexpected owner: {path}")
+    if directory and stat.S_IMODE(info.st_mode) != PRIVATE_DIR_MODE:
+        raise IPCError(f"private directory is not mode 0700: {path}")
+    return info
+
+
+def _validate_parent_chain(path: Path) -> None:
+    """Reject writable ancestors that could replace the state directory."""
+    probe = path.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    while True:
+        try:
+            info = os.stat(probe)
+        except OSError as exc:
+            raise IPCError(f"cannot inspect state parent {probe}") from exc
+        mode = stat.S_IMODE(info.st_mode)
+        if not stat.S_ISDIR(info.st_mode):
+            raise IPCError(f"state parent is not a directory: {probe}")
+        if mode & 0o022 and not (mode & stat.S_ISVTX):
+            raise IPCError(f"state parent is writable by another account: {probe}")
+        if probe == probe.parent:
+            return
+        probe = probe.parent
+
+
+def _default_state_dir() -> Path:
+    return Path(os.path.abspath(Path.home() / ".cache" / "codex-cua"))
+
+
+def _create_private_parents(path: Path) -> None:
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        missing.append(probe)
+        probe = probe.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=PRIVATE_DIR_MODE)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise IPCError(f"cannot create private state directory {directory}: {exc}") from exc
+        try:
+            _private_stat(directory, directory=True)
+        except IPCError as exc:
+            raise IPCError(f"new state directory is not private: {directory}") from exc
+
+
+def _secure_state_dir(path: Path) -> Path:
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise IPCError(f"private path is not an owned directory: {path}")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode != PRIVATE_DIR_MODE:
+        # Only the app-owned default directory is upgraded in place. A custom
+        # path may be a shared/system directory, so reject it instead of
+        # changing permissions outside our control.
+        if path != _default_state_dir():
+            raise IPCError(f"state directory must be mode 0700: {path}")
+        try:
+            os.chmod(path, PRIVATE_DIR_MODE)
+        except OSError as exc:
+            raise IPCError(f"cannot secure state directory {path}: {exc}") from exc
+        info = _private_stat(path, directory=True)
+        if stat.S_IMODE(info.st_mode) != PRIVATE_DIR_MODE:
+            raise IPCError(f"state directory is not mode 0700: {path}")
+    return path
+
+
+def _ensure_private_dir(path: Path) -> Path:
+    """Create a state directory and make its ownership and mode explicit."""
+    path = Path(os.path.abspath(path.expanduser()))
+    _validate_parent_chain(path)
+    _create_private_parents(path)
+    if not path.exists():
+        raise IPCError(f"private state directory was not created: {path}")
+    return _secure_state_dir(path)
+
+
+def _private_file_fd(
+    path: Path,
+    flags: int,
+    *,
+    mode: int = PRIVATE_FILE_MODE,
+    repair_mode: bool = False,
+) -> int:
+    """Open a private file without following a symlink, then verify its fd."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags | nofollow | cloexec, mode)
+    except OSError as exc:
+        raise IPCError(f"cannot open private file {path}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise IPCError(f"private path has unexpected type or owner: {path}")
+        actual_mode = stat.S_IMODE(info.st_mode)
+        if actual_mode != mode:
+            if not repair_mode:
+                raise IPCError(f"private file is not mode {mode:04o}: {path}")
+            os.fchmod(fd, mode)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _unlink_best_effort(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _write_private(path: Path, data: bytes, *, replace: bool = False) -> None:
+    """Write a bounded private file atomically."""
+    parent = path.parent
+    _ensure_private_dir(parent)
+    if replace:
+        temporary = parent / f".{path.name}.{secrets.token_hex(12)}.tmp"
+        try:
+            fd = _private_file_fd(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, repair_mode=True
+            )
+            try:
+                with os.fdopen(fd, "wb", closefd=True) as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            except Exception:
+                _unlink_best_effort(temporary)
+                raise
+        finally:
+            _unlink_best_effort(temporary)
+        return
+    fd = _private_file_fd(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, repair_mode=True)
+    with os.fdopen(fd, "wb", closefd=True) as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _read_private(path: Path, *, limit: int = IPC_MAX_FRAME) -> bytes:
+    """Read a private regular file through a no-follow descriptor."""
+    fd = _private_file_fd(path, os.O_RDONLY)
+    try:
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise IPCError(f"private file is too large: {path}")
+    return data
+
+
+def state_dir() -> Path:
+    return _ensure_private_dir(_configured_state_root())
+
+
+def _configured_state_root() -> Path:
+    configured = os.environ.get("CODEX_CUA_HOME") or _default_state_dir()
+    return Path(os.path.abspath(Path(configured).expanduser()))
+
+
+def _configured_state_path(name: str) -> Path:
+    return _configured_state_root() / name
+
+
+# These names remain exported for scripts that imported the old constants. The
+# daemon never uses the legacy socket; new sessions resolve through endpoint_path.
+LEGACY_SOCKET_PATH = _configured_state_path("session.sock")
+SOCKET_PATH = LEGACY_SOCKET_PATH
+PID_PATH = _configured_state_path("session.pid")
+LOG_PATH = _configured_state_path("session.log")
+ENDPOINT_PATH = _configured_state_path("session.json")
+LOCK_PATH = _configured_state_path("session.lock")
+START_LOCK_FD_ENV = "CODEX_CUA_START_LOCK_FD"
+
+
+def endpoint_path() -> Path:
+    return state_dir() / ENDPOINT_PATH.name
+
+
+def pid_path() -> Path:
+    return state_dir() / PID_PATH.name
+
+
+def log_path() -> Path:
+    return state_dir() / LOG_PATH.name
+
+
+def lock_path() -> Path:
+    return state_dir() / LOCK_PATH.name
+
+
+def _sockopt_bytes(conn: socket.socket, option: int, size: int) -> bytes | None:
+    """Read a Darwin local-socket option as bytes, if the OS exposes it."""
+    try:
+        value = conn.getsockopt(getattr(socket, "SOL_LOCAL", 0), option, size)
+    except (AttributeError, OSError):
+        return None
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, int):
+        return struct.pack("=i", value)
+    return None
+
+
+def _audit_identity(raw: bytes) -> tuple[int | None, int | None]:
+    """Extract euid and pid with Apple's libbsm audit-token API."""
+    if len(raw) < 32:
+        return None, None
+
+    class AuditToken(ctypes.Structure):
+        _fields_ = [("val", ctypes.c_uint32 * 8)]
+
+    try:
+        token = AuditToken.from_buffer_copy(raw[:32])
+        bsm = ctypes.CDLL("/usr/lib/libbsm.0.dylib")
+        euid = bsm.audit_token_to_euid
+        pid = bsm.audit_token_to_pid
+        euid.argtypes = [AuditToken]
+        euid.restype = ctypes.c_uint32
+        pid.argtypes = [AuditToken]
+        pid.restype = ctypes.c_int32
+        return int(euid(token)), int(pid(token))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None, None
+
+
+def _cf_string(cf: ctypes.CDLL, value: int | None) -> str | None:
+    """Convert a CoreFoundation string pointer without dereferencing NULL."""
+    if not value:
+        return None
+    buffer = ctypes.create_string_buffer(256)
+    try:
+        ok = cf.CFStringGetCString(value, buffer, len(buffer), 0x08000100)
+    except (OSError, TypeError):
+        return None
+    return buffer.value.decode("utf-8", "replace") if ok else None
+
+
+def _signing_identity(pid: int | None) -> tuple[str | None, str | None]:
+    """Read a live process team and identifier through Security.framework.
+
+    The audit token is kernel supplied. Security.framework still takes a PID,
+    so this is an informational/allow-list check rather than a replacement for
+    the token and UID checks. A caller can opt into strict team enforcement with
+    CODEX_CUA_ALLOWED_TEAM_IDS or CODEX_CUA_REQUIRE_TEAM_ID.
+    """
+    if pid is None or pid <= 0 or sys.platform != "darwin":
+        return None, None
+    try:
+        security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+        core_foundation = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        number = core_foundation.CFNumberCreate
+        dictionary = core_foundation.CFDictionaryCreate
+        get_value = core_foundation.CFDictionaryGetValue
+        release = core_foundation.CFRelease
+        number.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        number.restype = ctypes.c_void_p
+        dictionary.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        dictionary.restype = ctypes.c_void_p
+        get_value.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        get_value.restype = ctypes.c_void_p
+        get_string = core_foundation.CFStringGetCString
+        get_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        get_string.restype = ctypes.c_bool
+        release.argtypes = [ctypes.c_void_p]
+        copy_guest = security.SecCodeCopyGuestWithAttributes
+        copy_guest.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+        copy_guest.restype = ctypes.c_int32
+        check_validity = security.SecCodeCheckValidity
+        check_validity.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        check_validity.restype = ctypes.c_int32
+        copy_signing = security.SecCodeCopySigningInformation
+        copy_signing.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+        copy_signing.restype = ctypes.c_int32
+
+        pid_value = ctypes.c_int32(pid)
+        pid_number = number(None, 3, ctypes.byref(pid_value))
+        if not pid_number:
+            return None, None
+        guest = ctypes.c_void_p()
+        attributes_key = ctypes.c_void_p.in_dll(security, "kSecGuestAttributePid")
+        keys = (ctypes.c_void_p * 1)(attributes_key)
+        values = (ctypes.c_void_p * 1)(pid_number)
+        attributes = dictionary(None, keys, values, 1, None, None)
+        if not attributes:
+            release(pid_number)
+            return None, None
+        try:
+            if copy_guest(None, attributes, 0, ctypes.byref(guest)) != 0 or not guest.value:
+                return None, None
+            # A failed validity check means an unsigned or invalid process. In
+            # either case there is no trusted team to add to the allow-list.
+            if check_validity(guest, 0, None) != 0:
+                return None, None
+            information = ctypes.c_void_p()
+            if copy_signing(guest, 2, ctypes.byref(information)) != 0 or not information.value:
+                return None, None
+            try:
+                team_key = ctypes.c_void_p.in_dll(security, "kSecCodeInfoTeamIdentifier")
+                identifier_key = ctypes.c_void_p.in_dll(security, "kSecCodeInfoIdentifier")
+                team = _cf_string(core_foundation, get_value(information, team_key))
+                identifier = _cf_string(core_foundation, get_value(information, identifier_key))
+                return team, identifier
+            finally:
+                release(information)
+        finally:
+            if guest.value:
+                release(guest)
+            release(attributes)
+            release(pid_number)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None, None
+
+
+def peer_identity(conn: socket.socket) -> PeerIdentity:
+    """Read and validate kernel credentials for a connected local socket."""
+    peercred_option = getattr(socket, "LOCAL_PEERCRED", 1)
+    raw_cred = _sockopt_bytes(conn, peercred_option, 256)
+    if not raw_cred or len(raw_cred) < 8:
+        raise PeerAuthenticationError("kernel peer credentials are unavailable")
+    uid = struct.unpack_from("=I", raw_cred, 4)[0]
+
+    peer_pid_option = getattr(socket, "LOCAL_PEERPID", 2)
+    raw_pid = _sockopt_bytes(conn, peer_pid_option, 4)
+    pid = struct.unpack("=i", raw_pid[:4])[0] if raw_pid and len(raw_pid) >= 4 else None
+    if pid is not None and pid <= 0:
+        raise PeerAuthenticationError("kernel returned an invalid peer pid")
+
+    token_option = getattr(socket, "LOCAL_PEERTOKEN", 6)
+    raw_token = _sockopt_bytes(conn, token_option, 32)
+    audit_uid, audit_pid = _audit_identity(raw_token or b"")
+    if raw_token and (audit_uid is None or audit_pid is None):
+        raise PeerAuthenticationError("peer audit token could not be verified")
+    if audit_uid is not None and audit_uid != uid:
+        raise PeerAuthenticationError("peer credential and audit token disagree")
+    if audit_pid is not None and pid is not None and audit_pid != pid:
+        raise PeerAuthenticationError("peer pid and audit token disagree")
+    if sys.platform == "darwin" and (
+        pid is None or audit_uid is None or audit_pid is None
+    ):
+        raise PeerAuthenticationError("macOS did not provide a complete peer identity")
+    # Resolving a code signature is comparatively expensive. The kernel audit
+    # token and HMAC are always checked; ask Security.framework only when the
+    # caller enabled a team policy that can use the result.
+    team, identifier = (None, None)
+    if _allowed_team_ids() or _team_required():
+        team, identifier = _signing_identity(pid or audit_pid)
+    return PeerIdentity(uid, pid or audit_pid, audit_uid, audit_pid, team, identifier)
+
+
+def _allowed_team_ids() -> set[str]:
+    raw = os.environ.get("CODEX_CUA_ALLOWED_TEAM_IDS", "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _team_required() -> bool:
+    return os.environ.get("CODEX_CUA_REQUIRE_TEAM_ID", "").strip().lower() in {"1", "true", "yes"}
+
+
+def authorize_peer(identity: PeerIdentity, *, expected_pid: int | None = None) -> None:
+    """Apply UID, PID, and optional code-signing policy to a peer."""
+    current_uid = os.getuid()
+    if identity.uid != current_uid:
+        raise PeerAuthenticationError("peer is not running as the current user")
+    if expected_pid is not None and identity.pid != expected_pid:
+        raise PeerAuthenticationError("peer pid does not match the session endpoint")
+    allowed = _allowed_team_ids()
+    if allowed and identity.team_id not in allowed:
+        presented = identity.team_id or "unsigned"
+        raise PeerAuthenticationError(f"peer team {presented!r} is not allowed")
+    if _team_required() and not identity.team_id:
+        raise PeerAuthenticationError("a signed peer team identifier is required")
 
 
 class AppServer:
@@ -187,7 +625,8 @@ class AppServer:
             raise SystemExit("app-server thread/start returned no thread id")
 
     def _read_stdout(self) -> None:
-        assert self.proc and self.proc.stdout
+        if self.proc is None or self.proc.stdout is None:
+            return
         for line in self.proc.stdout:
             line = line.strip()
             if not line:
@@ -199,13 +638,15 @@ class AppServer:
                     print(f"app-server: {line[:400]}", file=sys.stderr)
 
     def _read_stderr(self) -> None:
-        assert self.proc and self.proc.stderr
+        if self.proc is None or self.proc.stderr is None:
+            return
         for line in self.proc.stderr:
             if self.verbose:
                 print(f"app-server stderr: {line.rstrip()}", file=sys.stderr)
 
     def _write(self, message: dict) -> None:
-        assert self.proc and self.proc.stdin
+        if self.proc is None or self.proc.stdin is None:
+            raise RuntimeError("codex app-server is not running")
         self.proc.stdin.write(json.dumps(message) + "\n")
         self.proc.stdin.flush()
 
@@ -289,105 +730,559 @@ def execute(server: AppServer, primed: set[str], payload: dict) -> dict:
 # Session daemon
 # ---------------------------------------------------------------------------
 
-SOCKET_PATH = state_dir() / "session.sock"
-PID_PATH = state_dir() / "session.pid"
-LOG_PATH = state_dir() / "session.log"
+def _canonical_json(value: object) -> bytes:
+    """Encode protocol data deterministically and reject non-finite numbers."""
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise IPCError(f"request is not valid JSON data: {exc}") from exc
+
+
+def _frame(value: object) -> bytes:
+    encoded = _canonical_json(value) + b"\n"
+    if len(encoded) > IPC_MAX_FRAME:
+        raise IPCError("IPC frame is too large")
+    return encoded
+
+
+def _send_frame(conn: socket.socket, value: object) -> None:
+    conn.sendall(_frame(value))
+
+
+def _recv_frame(conn: socket.socket) -> dict:
+    """Read exactly one bounded JSON object from a stream socket."""
+    data = bytearray()
+    while len(data) < IPC_MAX_FRAME:
+        chunk = conn.recv(min(4096, IPC_MAX_FRAME - len(data)))
+        if not chunk:
+            raise IPCError("IPC peer closed before sending a frame")
+        newline = chunk.find(b"\n")
+        if newline >= 0:
+            data.extend(chunk[:newline])
+            if chunk[newline + 1 :]:
+                raise IPCError("IPC peer sent data after the frame")
+            break
+        data.extend(chunk)
+    else:
+        raise IPCError("IPC frame exceeds the size limit")
+    if not data:
+        raise IPCError("IPC frame is empty")
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IPCError(f"IPC frame is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise IPCError("IPC frame must be a JSON object")
+    return value
+
+
+def _auth_digest(token: bytes, challenge: str, payload: dict) -> str:
+    try:
+        challenge_bytes = bytes.fromhex(challenge)
+    except ValueError as exc:
+        raise IPCError("invalid authentication challenge") from exc
+    if len(challenge_bytes) != 32:
+        raise IPCError("invalid authentication challenge length")
+    message = b"codex-cua/ipc-v2\0" + challenge_bytes + b"\0" + _canonical_json(payload)
+    return hmac.new(token, message, hashlib.sha256).hexdigest()
+
+
+def _server_proof(token: bytes, challenge: str) -> str:
+    try:
+        challenge_bytes = bytes.fromhex(challenge)
+    except ValueError as exc:
+        raise IPCError("invalid authentication challenge") from exc
+    if len(challenge_bytes) != 32:
+        raise IPCError("invalid authentication challenge length")
+    return hmac.new(
+        token, b"codex-cua/server-v2\0" + challenge_bytes, hashlib.sha256
+    ).hexdigest()
+
+
+def _validate_match(match: object) -> None:
+    if not isinstance(match, dict) or not set(match) <= {"pattern", "case_sensitive", "first"}:
+        raise IPCError("match must contain only pattern, case_sensitive, and first")
+    pattern = match.get("pattern")
+    if not isinstance(pattern, str) or len(pattern) > IPC_MAX_MATCH_PATTERN:
+        raise IPCError(f"match pattern must be at most {IPC_MAX_MATCH_PATTERN} characters")
+    for name in ("case_sensitive", "first"):
+        if name in match and not isinstance(match[name], bool):
+            raise IPCError(f"match {name} must be a boolean")
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise IPCError(f"match pattern is invalid: {exc}") from exc
+
+
+def _validate_tool_request(payload: dict) -> None:
+    tool = payload.get("tool")
+    if tool not in TOOLS:
+        raise IPCError(f"unknown tool {tool!r}")
+    if not set(payload) <= {"tool", "arguments", "timeout", "prime", "match"}:
+        raise IPCError("unsupported tool request fields")
+    if "prime" in payload and not isinstance(payload["prime"], bool):
+        raise IPCError("prime must be a boolean")
+    arguments = payload.get("arguments")
+    if not isinstance(arguments, dict):
+        raise IPCError("tool arguments must be a JSON object")
+    missing = [name for name in TOOLS[tool] if name not in arguments]
+    if missing:
+        raise IPCError(f"{tool} requires: {', '.join(missing)}")
+    timeout = payload.get("timeout", DEFAULT_TIMEOUT)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < float(timeout) <= IPC_MAX_TIMEOUT:
+        raise IPCError(f"timeout must be between 0 and {IPC_MAX_TIMEOUT:.0f} seconds")
+    if "match" in payload:
+        _validate_match(payload["match"])
+
+
+def _validate_request(payload: dict) -> None:
+    """Keep the authenticated daemon surface limited to supported operations."""
+    op = payload.get("op")
+    if op in {"ping", "shutdown"}:
+        if set(payload) != {"op"}:
+            raise IPCError(f"unsupported fields for {op}")
+        return
+    _validate_tool_request(payload)
+
+
+def _open_lock() -> int:
+    path = lock_path()
+    fd = _private_file_fd(path, os.O_RDWR | os.O_CREAT, repair_mode=True)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as exc:
+        os.close(fd)
+        if isinstance(exc, BlockingIOError) or getattr(exc, "errno", None) in {11, 35}:
+            raise IPCError("session daemon is already starting or running") from exc
+        raise IPCError(f"cannot lock session state: {exc}") from exc
+    return fd
+
+
+def _validate_inherited_lock(fd: int) -> None:
+    """Ensure a startup fd really names this user's private lock file."""
+    try:
+        expected = os.lstat(lock_path())
+        actual = os.fstat(fd)
+    except OSError as exc:
+        raise IPCError("cannot inspect daemon startup lock") from exc
+    if stat.S_ISLNK(expected.st_mode) or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+        raise IPCError("daemon startup lock does not name session.lock")
+    if not stat.S_ISREG(actual.st_mode) or actual.st_uid != os.getuid() or stat.S_IMODE(actual.st_mode) != PRIVATE_FILE_MODE:
+        raise IPCError("daemon startup lock is not private")
+
+
+def _read_endpoint(endpoint: Path) -> dict:
+    try:
+        raw = _read_private(endpoint, limit=16 * 1024)
+    except IPCError as exc:
+        if not endpoint.exists():
+            raise FileNotFoundError(endpoint) from exc
+        raise
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IPCError(f"session endpoint is invalid: {endpoint}") from exc
+    if not isinstance(document, dict) or document.get("version") != IPC_VERSION:
+        raise IPCError("unsupported session endpoint version")
+    return document
+
+
+def _endpoint_fields(document: dict) -> tuple[int, str, str]:
+    try:
+        pid = document["pid"]
+        socket_value = document["socket"]
+        auth_value = document["auth"]
+    except KeyError as exc:
+        raise IPCError("session endpoint is incomplete") from exc
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise IPCError("session endpoint has an invalid pid")
+    if not isinstance(socket_value, str) or not isinstance(auth_value, str):
+        raise IPCError("session endpoint has invalid paths")
+    return pid, socket_value, auth_value
+
+
+def _validate_raw_endpoint_paths(raw_socket: Path, raw_auth: Path) -> None:
+    if raw_socket.parent != raw_auth.parent:
+        raise IPCError("session endpoint paths are not in one directory")
+    try:
+        raw_session_info = os.lstat(raw_socket.parent)
+    except OSError as exc:
+        raise IPCError("session directory is unavailable") from exc
+    if stat.S_ISLNK(raw_session_info.st_mode):
+        raise IPCError("session directory must not be a symlink")
+    try:
+        raw_socket_info = os.lstat(raw_socket)
+    except FileNotFoundError:
+        raise FileNotFoundError(raw_socket)
+    except OSError as exc:
+        raise IPCError("session socket is unavailable") from exc
+    if stat.S_ISLNK(raw_socket_info.st_mode):
+        raise IPCError("session socket must not be a symlink")
+    try:
+        raw_auth_info = os.lstat(raw_auth)
+    except OSError as exc:
+        raise IPCError("session authentication file is unavailable") from exc
+    if stat.S_ISLNK(raw_auth_info.st_mode):
+        raise IPCError("session authentication file must not be a symlink")
+
+
+def _resolve_endpoint_paths(document: dict, root: Path) -> tuple[int, Path, Path]:
+    pid, socket_value, auth_value = _endpoint_fields(document)
+    # macOS commonly exposes /var/folders through a /private symlink. Compare
+    # canonical paths so the endpoint we wrote can be loaded on either spelling.
+    if not Path(socket_value).is_absolute() or not Path(auth_value).is_absolute():
+        raise IPCError("session endpoint paths must be absolute")
+    raw_socket = Path(socket_value)
+    raw_auth = Path(auth_value)
+    _validate_raw_endpoint_paths(raw_socket, raw_auth)
+    root = Path(os.path.realpath(root))
+    socket_path = Path(os.path.realpath(socket_value))
+    auth_path = Path(os.path.realpath(auth_value))
+    try:
+        socket_path.relative_to(root)
+        auth_path.relative_to(root)
+    except ValueError as exc:
+        raise IPCError("session endpoint escapes the private state directory") from exc
+    if socket_path.parent != auth_path.parent or not socket_path.parent.name.startswith(".s-"):
+        raise IPCError("session endpoint paths are not in one random session directory")
+    if len(os.fsencode(str(socket_path))) >= UNIX_SOCKET_PATH_MAX:
+        raise IPCError("session socket path is too long")
+    session_dir = socket_path.parent
+    _private_stat(session_dir, directory=True)
+    if socket_path.name != "session.sock" or auth_path.name != "auth.token":
+        raise IPCError("session endpoint has unexpected file names")
+    return pid, socket_path, auth_path
+
+
+def _read_session_token(auth_path: Path) -> bytes:
+    token_text = _read_private(auth_path, limit=128).decode("ascii", "strict").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", token_text):
+        raise IPCError("session authentication token is invalid")
+    try:
+        token = bytes.fromhex(token_text)
+    except ValueError as exc:
+        raise IPCError("session authentication token is invalid") from exc
+    if len(token) != 32:
+        raise IPCError("session authentication token has invalid length")
+    return token
+
+
+def _validate_session_socket(socket_path: Path) -> None:
+    try:
+        socket_info = os.lstat(socket_path)
+    except FileNotFoundError:
+        # The daemon may be between bind and endpoint publication. Let callers
+        # treat this as a dead session, while keeping endpoint parsing strict.
+        raise FileNotFoundError(socket_path)
+    if (
+        not stat.S_ISSOCK(socket_info.st_mode)
+        or socket_info.st_uid != os.getuid()
+        or socket_info.st_nlink != 1
+    ):
+        raise IPCError("session socket has unexpected type or owner")
+    if stat.S_IMODE(socket_info.st_mode) != PRIVATE_FILE_MODE:
+        raise IPCError("session socket is not mode 0600")
+
+
+def _load_session() -> SessionInfo:
+    endpoint = endpoint_path()
+    document = _read_endpoint(endpoint)
+    pid, socket_path, auth_path = _resolve_endpoint_paths(document, Path(os.path.realpath(state_dir())))
+    token = _read_session_token(auth_path)
+    _validate_session_socket(socket_path)
+    session_dir = socket_path.parent
+    return SessionInfo(endpoint, session_dir, socket_path, auth_path, pid, token)
+
+
+def _create_session() -> tuple[SessionInfo, socket.socket]:
+    root = state_dir()
+    session_dir = None
+    for _ in range(8):
+        candidate = root / f".s-{secrets.token_hex(6)}"
+        if len(os.fsencode(str(candidate / "session.sock"))) >= UNIX_SOCKET_PATH_MAX:
+            raise IPCError("CODEX_CUA_HOME is too long for a macOS Unix socket")
+        try:
+            candidate.mkdir(mode=PRIVATE_DIR_MODE)
+        except FileExistsError:
+            continue
+        session_dir = candidate
+        break
+    if session_dir is None:
+        raise IPCError("could not allocate a random session directory")
+    os.chmod(session_dir, PRIVATE_DIR_MODE)
+    auth_path = session_dir / "auth.token"
+    socket_path = session_dir / "session.sock"
+    endpoint = endpoint_path()
+    token = secrets.token_bytes(32)
+    listener: socket.socket | None = None
+    try:
+        _write_private(auth_path, token.hex().encode("ascii") + b"\n")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        os.chmod(socket_path, PRIVATE_FILE_MODE)
+        listener.listen(8)
+        document = {
+            "version": IPC_VERSION,
+            "pid": os.getpid(),
+            "socket": str(socket_path),
+            "auth": str(auth_path),
+        }
+        _write_private(endpoint, _canonical_json(document) + b"\n", replace=True)
+        _write_private(pid_path(), f"{os.getpid()}\n".encode(), replace=True)
+        return SessionInfo(endpoint, session_dir, socket_path, auth_path, os.getpid(), token), listener
+    except Exception:
+        if listener is not None:
+            listener.close()
+        _unlink_best_effort(socket_path)
+        _unlink_best_effort(auth_path)
+        try:
+            session_dir.rmdir()
+        except OSError:
+            pass
+        raise
+
+
+def _cleanup_session(session: SessionInfo, listener: socket.socket | None = None) -> None:
+    if listener is not None:
+        listener.close()
+    try:
+        current = _load_session()
+    except (FileNotFoundError, IPCError):
+        current = None
+    owns_endpoint = bool(
+        current
+        and os.path.realpath(current.socket_path) == os.path.realpath(session.socket_path)
+        and current.pid == session.pid
+        and hmac.compare_digest(current.token, session.token)
+    )
+    if owns_endpoint:
+        _unlink_best_effort(session.endpoint)
+        try:
+            if _read_private(pid_path(), limit=64).decode().strip() == str(session.pid):
+                _unlink_best_effort(pid_path())
+        except (IPCError, UnicodeDecodeError, FileNotFoundError):
+            pass
+    _unlink_best_effort(session.socket_path)
+    _unlink_best_effort(session.auth_path)
+    try:
+        session.session_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _server_handshake(conn: socket.socket, session: SessionInfo) -> dict:
+    conn.settimeout(IPC_AUTH_TIMEOUT)
+    identity = peer_identity(conn)
+    authorize_peer(identity)
+    challenge = secrets.token_hex(32)
+    _send_frame(
+        conn,
+        {
+            "version": IPC_VERSION,
+            "challenge": challenge,
+            "proof": _server_proof(session.token, challenge),
+        },
+    )
+    try:
+        envelope = _recv_frame(conn)
+    except IPCError as exc:
+        raise PeerAuthenticationError("malformed authentication envelope") from exc
+    payload = envelope.get("payload")
+    mac = envelope.get("mac")
+    if set(envelope) != {"payload", "mac"} or not isinstance(payload, dict) or not isinstance(mac, str):
+        raise PeerAuthenticationError("malformed authentication envelope")
+    try:
+        expected = _auth_digest(session.token, challenge, payload)
+    except IPCError as exc:
+        raise PeerAuthenticationError("malformed authentication envelope") from exc
+    if not hmac.compare_digest(mac, expected):
+        raise PeerAuthenticationError("request authentication failed")
+    _validate_request(payload)
+    return payload
+
+
+def _client_handshake(conn: socket.socket, session: SessionInfo, payload: dict) -> None:
+    conn.settimeout(IPC_AUTH_TIMEOUT)
+    identity = peer_identity(conn)
+    authorize_peer(identity, expected_pid=session.pid)
+    try:
+        hello = _recv_frame(conn)
+    except IPCError as exc:
+        raise PeerAuthenticationError("malformed daemon handshake") from exc
+    if (
+        set(hello) != {"version", "challenge", "proof"}
+        or hello.get("version") != IPC_VERSION
+        or not isinstance(hello.get("challenge"), str)
+        or not isinstance(hello.get("proof"), str)
+    ):
+        raise PeerAuthenticationError("unsupported daemon handshake")
+    expected_proof = _server_proof(session.token, hello["challenge"])
+    if not hmac.compare_digest(hello["proof"], expected_proof):
+        raise PeerAuthenticationError("daemon authentication failed")
+    _send_frame(conn, {"payload": payload, "mac": _auth_digest(session.token, hello["challenge"], payload)})
+
+
+def daemon_send(payload: dict, timeout: float, session: SessionInfo | None = None) -> dict:
+    _validate_request(payload)
+    session = session or _load_session()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        # Connecting and authenticating must not inherit a caller-controlled
+        # operation timeout. A stale or hostile endpoint gets five seconds.
+        conn.settimeout(IPC_AUTH_TIMEOUT)
+        conn.connect(str(session.socket_path))
+        _client_handshake(conn, session, payload)
+        conn.settimeout(timeout + 15)
+        reply = _recv_frame(conn)
+    if not isinstance(reply.get("ok"), bool):
+        raise IPCError("daemon returned an invalid response")
+    return reply
 
 
 def daemon_alive() -> bool:
-    if not SOCKET_PATH.exists():
+    try:
+        session = _load_session()
+    except FileNotFoundError:
         return False
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(2)
-            sock.connect(str(SOCKET_PATH))
-        return True
-    except OSError:
+        reply = daemon_send({"op": "ping"}, 2, session)
+    except (ConnectionError, FileNotFoundError, TimeoutError, BrokenPipeError):
         return False
+    return reply.get("ok") is True
 
 
-def daemon_send(payload: dict, timeout: float) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout + 15)
-        sock.connect(str(SOCKET_PATH))
-        sock.sendall((json.dumps(payload) + "\n").encode())
-        chunks = []
-        while True:
-            data = sock.recv(1 << 20)
-            if not data:
-                break
-            chunks.append(data)
-            if chunks[-1].endswith(b"\n"):
-                break
-    return json.loads(b"".join(chunks).decode())
+def _daemon_lock_from_environment() -> int:
+    inherited = os.environ.pop(START_LOCK_FD_ENV, "")
+    if inherited:
+        try:
+            fd = int(inherited)
+            os.fstat(fd)
+            _validate_inherited_lock(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise IPCError("daemon startup lock is not held") from exc
+            return fd
+        except (OSError, ValueError) as exc:
+            raise IPCError("invalid daemon startup lock") from exc
+    return _open_lock()
+
+
+def _handle_daemon_connection(
+    conn: socket.socket,
+    session: SessionInfo,
+    server: AppServer,
+    primed: set[str],
+) -> bool:
+    """Authenticate and serve one request. Return true for an authorized stop."""
+    try:
+        payload = _server_handshake(conn, session)
+        if payload.get("op") == "ping":
+            reply = {"ok": True, "thread": server.thread_id, "pid": os.getpid()}
+        elif payload.get("op") == "shutdown":
+            _send_frame(conn, {"ok": True})
+            return True
+        else:
+            reply = {"ok": True, "result": execute(server, primed, payload)}
+    except PeerAuthenticationError:
+        # Do not reveal whether the token, peer identity, or endpoint was wrong.
+        try:
+            _send_frame(conn, {"ok": False, "error": "unauthorized"})
+        except OSError:
+            pass
+    except Exception as exc:  # noqa: BLE001 - report every failure to the client
+        message = str(exc) if isinstance(exc, (RuntimeError, SystemExit)) else f"{type(exc).__name__}: {exc}"
+        try:
+            _send_frame(conn, {"ok": False, "error": message})
+        except OSError:
+            pass
+    else:
+        _send_frame(conn, reply)
+    return False
 
 
 def run_daemon(verbose: bool) -> None:
+    lock_fd = _daemon_lock_from_environment()
     server = AppServer(verbose=verbose)
-    server.start()
-    primed: set[str] = set()
+    session: SessionInfo | None = None
+    listener: socket.socket | None = None
+    try:
+        server.start()
+        session, listener = _create_session()
+        primed: set[str] = set()
 
-    if SOCKET_PATH.exists():
-        SOCKET_PATH.unlink()
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(SOCKET_PATH))
-    listener.listen(8)
-    PID_PATH.write_text(str(os.getpid()))
+        def shutdown(*_args):
+            _cleanup_session(session, listener)
+            server.stop()
+            os.close(lock_fd)
+            os._exit(0)
 
-    def shutdown(*_args):
-        server.stop()
-        for path in (SOCKET_PATH, PID_PATH):
-            path.unlink(missing_ok=True)
-        os._exit(0)
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
-
-    while True:
-        conn, _ = listener.accept()
-        with conn:
-            buf = b""
-            while not buf.endswith(b"\n"):
-                data = conn.recv(1 << 16)
-                if not data:
-                    break
-                buf += data
-            if not buf.strip():
-                continue
-            try:
-                payload = json.loads(buf.decode())
-                if payload.get("op") == "ping":
-                    reply = {"ok": True, "thread": server.thread_id, "pid": os.getpid()}
-                elif payload.get("op") == "shutdown":
-                    conn.sendall(b'{"ok": true}\n')
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+        while True:
+            conn, _ = listener.accept()
+            with conn:
+                if _handle_daemon_connection(conn, session, server, primed):
                     shutdown()
                     return
-                else:
-                    reply = {"ok": True, "result": execute(server, primed, payload)}
-            except Exception as exc:  # noqa: BLE001 - report every failure to the client
-                message = str(exc) if isinstance(exc, (RuntimeError, SystemExit)) else f"{type(exc).__name__}: {exc}"
-                reply = {"ok": False, "error": message}
-            conn.sendall((json.dumps(reply) + "\n").encode())
+    finally:
+        if session is not None:
+            _cleanup_session(session, listener)
+        server.stop()
+        os.close(lock_fd)
 
 
 def ensure_daemon(verbose: bool) -> None:
     if daemon_alive():
         return
-    SOCKET_PATH.unlink(missing_ok=True)
-    log = open(LOG_PATH, "ab")
-    subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "daemon", "run"] + (["--verbose"] if verbose else []),
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=log,
-        start_new_session=True,
-    )
-    deadline = time.time() + 90
-    while time.time() < deadline:
+    lock_fd = _open_lock()
+    child = None
+    try:
         if daemon_alive():
             return
+        log_path_value = log_path()
+        log_fd = _private_file_fd(
+            log_path_value, os.O_WRONLY | os.O_CREAT | os.O_APPEND, repair_mode=True
+        )
+        env = os.environ.copy()
+        env[START_LOCK_FD_ENV] = str(lock_fd)
+        try:
+            child = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "daemon", "run"] + (["--verbose"] if verbose else []),
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=log_fd,
+                start_new_session=True,
+                pass_fds=(lock_fd,),
+                env=env,
+            )
+        finally:
+            os.close(log_fd)
+        # The lock is inherited by the child. Closing this descriptor leaves the
+        # lock held while AppServer starts, preventing duplicate daemons.
+        os.close(lock_fd)
+        lock_fd = -1
+    except Exception:
+        if child is not None and child.poll() is None:
+            child.terminate()
+        raise
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        try:
+            if daemon_alive():
+                return
+        except IPCError:
+            pass
         time.sleep(0.2)
-    raise SystemExit(f"session daemon failed to start; see {LOG_PATH}")
+    raise SystemExit(f"session daemon failed to start; see {log_path()}")
 
 
 # ---------------------------------------------------------------------------
@@ -607,11 +1502,14 @@ def cmd_daemon(opts):
         return 0
     if opts.action == "start":
         ensure_daemon(opts.verbose)
-        print(f"session daemon running (pid {PID_PATH.read_text().strip()}), socket {SOCKET_PATH}")
+        session = _load_session()
+        print(f"session daemon running (pid {session.pid}), socket {session.socket_path}")
         return 0
     if opts.action == "status":
         if daemon_alive():
-            info = daemon_send({"op": "ping"}, 10)
+            session = _load_session()
+            info = daemon_send({"op": "ping"}, 10, session)
+            info["socket"] = str(session.socket_path)
             print(json.dumps(info, indent=2))
             return 0
         print("session daemon not running")
@@ -622,10 +1520,8 @@ def cmd_daemon(opts):
             return 0
         try:
             daemon_send({"op": "shutdown"}, 10)
-        except OSError:
+        except (OSError, IPCError):
             pass
-        SOCKET_PATH.unlink(missing_ok=True)
-        PID_PATH.unlink(missing_ok=True)
         print("session daemon stopped")
         return 0
     if opts.action == "restart":
@@ -636,6 +1532,45 @@ def cmd_daemon(opts):
     raise SystemExit(f"unknown daemon action {opts.action}")
 
 
+def _doctor_prerequisites(check) -> bool:
+    codex_ok = False
+    try:
+        codex = codex_bin()
+        check("codex CLI", True, codex)
+        codex_ok = True
+    except SystemExit as exc:
+        check("codex CLI", False, str(exc))
+        codex = None
+    if codex:
+        try:
+            signing = subprocess.run(
+                ["/usr/bin/codesign", "-dv", "--verbose=2", codex],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            ).stderr
+            team = next((l.split("=", 1)[1] for l in signing.splitlines() if l.startswith("TeamIdentifier=")), "")
+            check(
+                "codex signed by OpenAI",
+                team == OPENAI_TEAM_ID,
+                team or "no team identifier (Computer Use will reject this host process)",
+            )
+            codex_ok = team == OPENAI_TEAM_ID
+        except Exception as exc:  # noqa: BLE001
+            check("codex signature", False, str(exc))
+    bundle_ok = False
+    try:
+        app = computer_use_app()
+        check("Computer Use bundle", True, str(app))
+        client = mcp_client_path(app)
+        bundle_ok = client.is_file()
+        check("MCP client binary", bundle_ok, str(client))
+    except SystemExit as exc:
+        check("Computer Use bundle", False, str(exc))
+    return codex_ok and bundle_ok
+
+
 def cmd_doctor(opts):
     ok = True
 
@@ -644,40 +1579,16 @@ def cmd_doctor(opts):
         ok = ok and good
         print(f"{'pass' if good else 'FAIL'}  {label}: {detail}")
 
-    try:
-        codex = codex_bin()
-        check("codex CLI", True, codex)
-    except SystemExit as exc:
-        check("codex CLI", False, str(exc))
-        codex = None
-
-    if codex:
-        try:
-            signing = subprocess.run(
-                ["codesign", "-dv", "--verbose=2", codex],
-                capture_output=True,
-                text=True,
-                timeout=20,
-            ).stderr
-            team = next((l.split("=", 1)[1] for l in signing.splitlines() if l.startswith("TeamIdentifier=")), "")
-            check(
-                "codex signed by OpenAI",
-                team == "2DC432GLL2",
-                team or "no team identifier (Computer Use will reject this host process)",
-            )
-        except Exception as exc:  # noqa: BLE001
-            check("codex signature", False, str(exc))
+    ok = _doctor_prerequisites(check)
 
     try:
-        app = computer_use_app()
-        check("Computer Use bundle", True, str(app))
-        client = mcp_client_path(app)
-        check("MCP client binary", client.is_file(), str(client))
-    except SystemExit as exc:
-        check("Computer Use bundle", False, str(exc))
-
-    print(f"info  session daemon: {SOCKET_PATH if daemon_alive() else 'not running (starts on demand)'}")
-
+        session = _load_session()
+    except (FileNotFoundError, IPCError):
+        session = None
+    if session and daemon_alive():
+        print(f"info  session daemon: authenticated (pid {session.pid}, socket {session.socket_path})")
+    else:
+        print("info  session daemon: not running (starts on demand)")
     if ok:
         try:
             result = invoke("list_apps", {}, opts)
