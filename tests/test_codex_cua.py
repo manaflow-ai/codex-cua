@@ -1,5 +1,6 @@
 """Unit tests for codex-cua tree parsing. Run: python3 -m unittest discover tests"""
 
+import ctypes
 import importlib.machinery
 import importlib.util
 import json
@@ -310,6 +311,51 @@ class SessionSecurityTest(unittest.TestCase):
             with self.assertRaises(cua.PeerAuthenticationError):
                 cua.authorize_peer(cua.PeerIdentity(os.getuid(), 1, os.getuid(), 1, "other.team", "id"))
         finally:
+            if previous is None:
+                os.environ.pop("CODEX_CUA_ALLOWED_TEAM_IDS", None)
+            else:
+                os.environ["CODEX_CUA_ALLOWED_TEAM_IDS"] = previous
+
+    def test_team_policy_uses_typed_corefoundation_pointer(self):
+        class FakeStringFunction:
+            argtypes = None
+            restype = None
+
+            def __call__(self, value, buffer, length, _encoding):
+                if not isinstance(value, ctypes.c_void_p):
+                    raise TypeError("CFString pointer was not typed")
+                buffer.value = b"trusted"
+                return True
+
+        class FakeCoreFoundation:
+            CFStringGetCString = FakeStringFunction()
+
+        previous = os.environ.get("CODEX_CUA_ALLOWED_TEAM_IDS")
+        os.environ["CODEX_CUA_ALLOWED_TEAM_IDS"] = "trusted"
+        try:
+            self.assertEqual(cua._allowed_team_ids(), {"trusted"})
+            core_foundation = FakeCoreFoundation()
+            self.assertEqual(cua._cf_string(core_foundation, 0x1_0000_0001), "trusted")
+            self.assertEqual(core_foundation.CFStringGetCString.argtypes[0], ctypes.c_void_p)
+            self.assertIs(core_foundation.CFStringGetCString.restype, ctypes.c_bool)
+        finally:
+            if previous is None:
+                os.environ.pop("CODEX_CUA_ALLOWED_TEAM_IDS", None)
+            else:
+                os.environ["CODEX_CUA_ALLOWED_TEAM_IDS"] = previous
+
+    def test_team_policy_rejects_an_unlisted_peer(self):
+        previous = os.environ.get("CODEX_CUA_ALLOWED_TEAM_IDS")
+        os.environ["CODEX_CUA_ALLOWED_TEAM_IDS"] = "test-unlisted-team"
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            identity = cua.peer_identity(left)
+            self.assertNotEqual(identity.team_id, "test-unlisted-team")
+            with self.assertRaises(cua.PeerAuthenticationError):
+                cua.authorize_peer(identity)
+        finally:
+            left.close()
+            right.close()
             if previous is None:
                 os.environ.pop("CODEX_CUA_ALLOWED_TEAM_IDS", None)
             else:

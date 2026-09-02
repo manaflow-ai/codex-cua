@@ -421,8 +421,16 @@ def _cf_string(cf: ctypes.CDLL, value: int | None) -> str | None:
         return None
     buffer = ctypes.create_string_buffer(256)
     try:
-        ok = cf.CFStringGetCString(value, buffer, len(buffer), 0x08000100)
-    except (OSError, TypeError):
+        get_string = cf.CFStringGetCString
+        get_string.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_long,
+            ctypes.c_uint32,
+        ]
+        get_string.restype = ctypes.c_bool
+        ok = get_string(ctypes.c_void_p(value), buffer, len(buffer), 0x08000100)
+    except (OSError, TypeError, ValueError):
         return None
     return buffer.value.decode("utf-8", "replace") if ok else None
 
@@ -457,9 +465,6 @@ def _signing_identity(pid: int | None) -> tuple[str | None, str | None]:
         dictionary.restype = ctypes.c_void_p
         get_value.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         get_value.restype = ctypes.c_void_p
-        get_string = core_foundation.CFStringGetCString
-        get_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
-        get_string.restype = ctypes.c_bool
         release.argtypes = [ctypes.c_void_p]
         copy_guest = security.SecCodeCopyGuestWithAttributes
         copy_guest.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
