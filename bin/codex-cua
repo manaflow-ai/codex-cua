@@ -1034,7 +1034,8 @@ def _create_session() -> tuple[SessionInfo, socket.socket]:
         _write_private(auth_path, token.hex().encode("ascii") + b"\n")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(socket_path))
-        os.chmod(socket_path, PRIVATE_FILE_MODE)
+        # Do not follow a path swap while applying the socket mode.
+        os.chmod(socket_path, PRIVATE_FILE_MODE, follow_symlinks=False)
         listener.listen(8)
         document = {
             "version": IPC_VERSION,
