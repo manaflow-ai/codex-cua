@@ -93,7 +93,7 @@ codex-cua daemon restart
 codex-cua daemon stop      # logs in ~/.cache/codex-cua/session.log
 ```
 
-The daemon endpoint is a random Unix socket inside a mode `0700` session directory. A mode `0600` token file and a mutual per-connection challenge response authenticate the daemon and every request, including `status` and `stop`. macOS peer credentials and the audit token are checked before the request is read. The endpoint, PID, log, and lock files are opened without following symlinks and are kept mode `0600`.
+The daemon endpoint is a random Unix socket inside a mode `0700` session directory. A mode `0600` token file and a mutual per-connection challenge response authenticate the daemon and every request, including `status` and `stop`. macOS peer credentials and the audit token are checked before the request is read. The endpoint, PID, log, and lock files are opened without following symlinks and are kept mode `0600`. Requests are capped at 1 MiB and replies at 16 MiB, which leaves room for a base64 screenshot without allowing unbounded memory use.
 
 The normal Python CLI is unsigned, so the default policy requires the current user and the kernel audit-token/PID match. Managed installations can require a code-signing team with `CODEX_CUA_ALLOWED_TEAM_IDS=TEAMID[,TEAMID...]`; `CODEX_CUA_REQUIRE_TEAM_ID=1` also rejects unsigned clients. Team checks use Security.framework when macOS provides it and fail closed when strict mode is enabled.
 
