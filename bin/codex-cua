@@ -43,6 +43,9 @@ DEFAULT_TIMEOUT = 180.0
 IPC_VERSION = 2
 IPC_AUTH_TIMEOUT = 5.0
 IPC_MAX_FRAME = 1 << 20
+# Tool replies can include a base64 screenshot. Keep them bounded, but allow
+# substantially more space than a request or authentication frame.
+IPC_MAX_REPLY_FRAME = 16 << 20
 IPC_MAX_TIMEOUT = 600.0
 IPC_MAX_MATCH_PATTERN = 4096
 UNIX_SOCKET_PATH_MAX = 104
@@ -521,7 +524,9 @@ def peer_identity(conn: socket.socket) -> PeerIdentity:
     if pid is not None and pid <= 0:
         raise PeerAuthenticationError("kernel returned an invalid peer pid")
 
-    token_option = getattr(socket, "LOCAL_PEERTOKEN", 6)
+    # Python 3.11 and 3.14 omit this Darwin constant. The value is
+    # LOCAL_PEERTOKEN 0x006 in Apple's sys/un.h (MacOSX15 and MacOSX26 SDKs).
+    token_option = getattr(socket, "LOCAL_PEERTOKEN", 0x006)
     raw_token = _sockopt_bytes(conn, token_option, 32)
     audit_uid, audit_pid = _audit_identity(raw_token or b"")
     if raw_token and (audit_uid is None or audit_pid is None):
@@ -744,22 +749,26 @@ def _canonical_json(value: object) -> bytes:
         raise IPCError(f"request is not valid JSON data: {exc}") from exc
 
 
-def _frame(value: object) -> bytes:
+def _frame(value: object, *, limit: int = IPC_MAX_FRAME) -> bytes:
     encoded = _canonical_json(value) + b"\n"
-    if len(encoded) > IPC_MAX_FRAME:
+    if len(encoded) > limit:
         raise IPCError("IPC frame is too large")
     return encoded
 
 
-def _send_frame(conn: socket.socket, value: object) -> None:
-    conn.sendall(_frame(value))
+def _send_frame(
+    conn: socket.socket, value: object, *, limit: int = IPC_MAX_FRAME
+) -> None:
+    conn.sendall(_frame(value, limit=limit))
 
 
-def _recv_frame(conn: socket.socket) -> dict:
+def _recv_frame(
+    conn: socket.socket, *, limit: int = IPC_MAX_FRAME
+) -> dict:
     """Read exactly one bounded JSON object from a stream socket."""
     data = bytearray()
-    while len(data) < IPC_MAX_FRAME:
-        chunk = conn.recv(min(4096, IPC_MAX_FRAME - len(data)))
+    while len(data) < limit:
+        chunk = conn.recv(min(4096, limit - len(data)))
         if not chunk:
             raise IPCError("IPC peer closed before sending a frame")
         newline = chunk.find(b"\n")
@@ -770,7 +779,7 @@ def _recv_frame(conn: socket.socket) -> dict:
             break
         data.extend(chunk)
     else:
-        raise IPCError("IPC frame exceeds the size limit")
+        raise IPCError(f"IPC frame exceeds the {limit}-byte size limit")
     if not data:
         raise IPCError("IPC frame is empty")
     try:
@@ -1128,6 +1137,14 @@ def _client_handshake(conn: socket.socket, session: SessionInfo, payload: dict) 
     _send_frame(conn, {"payload": payload, "mac": _auth_digest(session.token, hello["challenge"], payload)})
 
 
+def _reply_timeout(payload: dict) -> float:
+    """Return a bounded write timeout for an authenticated request reply."""
+    if payload.get("op") in {"ping", "shutdown"}:
+        return IPC_AUTH_TIMEOUT
+    # _validate_request has already checked this value before this helper runs.
+    return float(payload.get("timeout", DEFAULT_TIMEOUT)) + IPC_AUTH_TIMEOUT
+
+
 def daemon_send(payload: dict, timeout: float, session: SessionInfo | None = None) -> dict:
     _validate_request(payload)
     session = session or _load_session()
@@ -1138,7 +1155,7 @@ def daemon_send(payload: dict, timeout: float, session: SessionInfo | None = Non
         conn.connect(str(session.socket_path))
         _client_handshake(conn, session, payload)
         conn.settimeout(timeout + 15)
-        reply = _recv_frame(conn)
+        reply = _recv_frame(conn, limit=IPC_MAX_REPLY_FRAME)
     if not isinstance(reply.get("ok"), bool):
         raise IPCError("daemon returned an invalid response")
     return reply
@@ -1147,11 +1164,11 @@ def daemon_send(payload: dict, timeout: float, session: SessionInfo | None = Non
 def daemon_alive() -> bool:
     try:
         session = _load_session()
-    except FileNotFoundError:
+    except (FileNotFoundError, IPCError):
         return False
     try:
         reply = daemon_send({"op": "ping"}, 2, session)
-    except (ConnectionError, FileNotFoundError, TimeoutError, BrokenPipeError):
+    except (ConnectionError, FileNotFoundError, IPCError, TimeoutError, BrokenPipeError):
         return False
     return reply.get("ok") is True
 
@@ -1185,24 +1202,29 @@ def _handle_daemon_connection(
         if payload.get("op") == "ping":
             reply = {"ok": True, "thread": server.thread_id, "pid": os.getpid()}
         elif payload.get("op") == "shutdown":
+            conn.settimeout(IPC_AUTH_TIMEOUT)
             _send_frame(conn, {"ok": True})
             return True
         else:
             reply = {"ok": True, "result": execute(server, primed, payload)}
+        # Keep a slow client from blocking the daemon forever, while allowing
+        # enough time for the largest bounded screenshot reply.
+        conn.settimeout(_reply_timeout(payload))
+        _send_frame(conn, reply, limit=IPC_MAX_REPLY_FRAME)
     except PeerAuthenticationError:
         # Do not reveal whether the token, peer identity, or endpoint was wrong.
         try:
+            conn.settimeout(IPC_AUTH_TIMEOUT)
             _send_frame(conn, {"ok": False, "error": "unauthorized"})
         except OSError:
             pass
     except Exception as exc:  # noqa: BLE001 - report every failure to the client
         message = str(exc) if isinstance(exc, (RuntimeError, SystemExit)) else f"{type(exc).__name__}: {exc}"
         try:
+            conn.settimeout(IPC_AUTH_TIMEOUT)
             _send_frame(conn, {"ok": False, "error": message})
         except OSError:
             pass
-    else:
-        _send_frame(conn, reply)
     return False
 
 
@@ -1579,7 +1601,8 @@ def cmd_doctor(opts):
         ok = ok and good
         print(f"{'pass' if good else 'FAIL'}  {label}: {detail}")
 
-    ok = _doctor_prerequisites(check)
+    prerequisites_ok = _doctor_prerequisites(check)
+    ok = ok and prerequisites_ok
 
     try:
         session = _load_session()

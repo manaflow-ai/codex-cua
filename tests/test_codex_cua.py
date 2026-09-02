@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -131,11 +132,12 @@ class SessionSecurityTest(unittest.TestCase):
         received = []
 
         def serve():
+            listener.settimeout(5)
             conn, _ = listener.accept()
             with conn:
                 received.append(cua._server_handshake(conn, session))
 
-        thread = threading.Thread(target=serve)
+        thread = threading.Thread(target=serve, daemon=True)
         thread.start()
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
@@ -162,13 +164,14 @@ class SessionSecurityTest(unittest.TestCase):
                 return {}
 
         def serve():
+            listener.settimeout(5)
             conn, _ = listener.accept()
             with conn:
                 result.append(
                     cua._handle_daemon_connection(conn, session, FakeServer(), set())
                 )
 
-        thread = threading.Thread(target=serve)
+        thread = threading.Thread(target=serve, daemon=True)
         thread.start()
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
@@ -185,11 +188,84 @@ class SessionSecurityTest(unittest.TestCase):
                 thread.join(timeout=2)
             cua._cleanup_session(session, listener)
 
+    def test_large_reply_uses_reply_frame_limit(self):
+        session, listener = cua._create_session()
+        result = []
+        large_text = "x" * (cua.IPC_MAX_FRAME + 4096)
+
+        class FakeServer:
+            thread_id = "test"
+
+            def call_tool(self, *_args, **_kwargs):
+                return {"content": [{"type": "text", "text": large_text}]}
+
+        def serve():
+            listener.settimeout(5)
+            conn, _ = listener.accept()
+            with conn:
+                result.append(cua._handle_daemon_connection(conn, session, FakeServer(), set()))
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                conn.connect(str(session.socket_path))
+                cua._client_handshake(conn, session, {"tool": "list_apps", "arguments": {}})
+                reply = cua._recv_frame(conn, limit=cua.IPC_MAX_REPLY_FRAME)
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(result and result[0] is False)
+            self.assertTrue(reply["ok"])
+            self.assertGreater(len(reply["result"]["content"][0]["text"]), cua.IPC_MAX_FRAME)
+        finally:
+            if thread.is_alive():
+                listener.close()
+                thread.join(timeout=2)
+            cua._cleanup_session(session, listener)
+
+    def test_oversized_reply_is_reported_without_killing_handler(self):
+        session, listener = cua._create_session()
+        result = []
+        previous_limit = cua.IPC_MAX_REPLY_FRAME
+        cua.IPC_MAX_REPLY_FRAME = 1024
+
+        class FakeServer:
+            thread_id = "test"
+
+            def call_tool(self, *_args, **_kwargs):
+                return {"content": [{"type": "text", "text": "x" * 2048}]}
+
+        def serve():
+            listener.settimeout(5)
+            conn, _ = listener.accept()
+            with conn:
+                result.append(cua._handle_daemon_connection(conn, session, FakeServer(), set()))
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                conn.connect(str(session.socket_path))
+                cua._client_handshake(conn, session, {"tool": "list_apps", "arguments": {}})
+                reply = cua._recv_frame(conn)
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [False])
+            self.assertFalse(reply["ok"])
+            self.assertIn("frame is too large", reply["error"])
+        finally:
+            cua.IPC_MAX_REPLY_FRAME = previous_limit
+            if thread.is_alive():
+                listener.close()
+                thread.join(timeout=2)
+            cua._cleanup_session(session, listener)
+
     def test_client_rejects_a_socket_without_server_proof(self):
         session, listener = cua._create_session()
         result = []
 
         def fake_server():
+            listener.settimeout(5)
             conn, _ = listener.accept()
             with conn:
                 conn.sendall(
@@ -209,7 +285,7 @@ class SessionSecurityTest(unittest.TestCase):
                 except Exception as exc:  # noqa: BLE001 - assert no request was sent
                     result.append(exc)
 
-        thread = threading.Thread(target=fake_server)
+        thread = threading.Thread(target=fake_server, daemon=True)
         thread.start()
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
@@ -257,6 +333,14 @@ class SessionSecurityTest(unittest.TestCase):
                 }
             )
 
+    def test_daemon_alive_treats_invalid_endpoint_as_dead(self):
+        endpoint = cua.endpoint_path()
+        cua._write_private(endpoint, b"{}\n")
+        try:
+            self.assertFalse(cua.daemon_alive())
+        finally:
+            endpoint.unlink(missing_ok=True)
+
     def test_endpoint_symlink_and_unsafe_directory_are_rejected(self):
         session, listener = cua._create_session()
         try:
@@ -298,25 +382,32 @@ class SessionSecurityTest(unittest.TestCase):
 
     def test_relative_home_is_normalized_for_endpoint_paths(self):
         previous = os.environ["CODEX_CUA_HOME"]
-        with tempfile.TemporaryDirectory(dir=".") as relative_dir:
-            os.environ["CODEX_CUA_HOME"] = os.path.relpath(relative_dir)
+        previous_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory(dir="/tmp") as holder:
+            os.chdir(holder)
+            os.environ["CODEX_CUA_HOME"] = "relative-state"
             try:
                 session, listener = cua._create_session()
                 try:
                     self.assertTrue(session.endpoint.is_absolute())
+                    self.assertEqual(
+                        session.endpoint,
+                        Path(os.path.abspath("relative-state/session.json")),
+                    )
                     self.assertEqual(cua._load_session(), session)
                 finally:
                     cua._cleanup_session(session, listener)
             finally:
                 os.environ["CODEX_CUA_HOME"] = previous
+                os.chdir(previous_cwd)
 
     def test_missing_state_parents_are_created_private(self):
         previous = os.environ["CODEX_CUA_HOME"]
-        with tempfile.TemporaryDirectory(dir=".") as holder:
+        with tempfile.TemporaryDirectory(dir="/tmp") as holder:
             root = Path(holder) / "one" / "two"
             os.environ["CODEX_CUA_HOME"] = str(root)
             try:
-                self.assertEqual(cua.state_dir(), root.resolve())
+                self.assertEqual(cua.state_dir(), Path(os.path.abspath(root)))
                 self.assertEqual(stat.S_IMODE(os.stat(root / ".." / "..").st_mode), 0o700)
                 self.assertEqual(stat.S_IMODE(os.stat(root / "..").st_mode), 0o700)
                 self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700)
@@ -327,6 +418,20 @@ class SessionSecurityTest(unittest.TestCase):
         identity = cua.PeerIdentity(os.getuid(), os.getpid(), os.getuid(), os.getpid(), None, None)
         with self.assertRaises(cua.PeerAuthenticationError):
             cua.authorize_peer(identity, expected_pid=os.getpid() + 1)
+
+    def test_darwin_peer_token_option_is_kernel_audit_token(self):
+        if sys.platform != "darwin":
+            self.skipTest("Darwin local-socket options are not available")
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            raw = cua._sockopt_bytes(left, 0x006, 32)
+            self.assertEqual(len(raw or b""), 32)
+            identity = cua.peer_identity(left)
+            self.assertEqual(identity.audit_pid, os.getpid())
+            self.assertEqual(identity.audit_uid, os.getuid())
+        finally:
+            left.close()
+            right.close()
 
 
 if __name__ == "__main__":
