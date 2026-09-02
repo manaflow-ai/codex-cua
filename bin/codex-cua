@@ -918,6 +918,8 @@ def _endpoint_fields(document: dict) -> tuple[int, str, str]:
         raise IPCError("session endpoint has an invalid pid")
     if not isinstance(socket_value, str) or not isinstance(auth_value, str):
         raise IPCError("session endpoint has invalid paths")
+    if "\x00" in socket_value or "\x00" in auth_value:
+        raise IPCError("session endpoint paths contain a NUL byte")
     return pid, socket_value, auth_value
 
 
