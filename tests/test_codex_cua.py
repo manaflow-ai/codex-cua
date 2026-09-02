@@ -12,8 +12,8 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 SPEC = importlib.util.spec_from_loader(
     "codex_cua",

@@ -52,6 +52,7 @@ UNIX_SOCKET_PATH_MAX = 104
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 OPENAI_TEAM_ID = "2DC432GLL2"
+DARWIN_PEER_TOKEN_FALLBACKS = (0x006, 0x005)
 
 TOOLS = {
     "list_apps": (),
@@ -415,6 +416,36 @@ def _audit_identity(raw: bytes) -> tuple[int | None, int | None]:
         return None, None
 
 
+def _peer_audit_identity(
+    conn: socket.socket, uid: int, pid: int | None
+) -> tuple[int | None, int | None]:
+    """Probe Darwin token options and keep only a token matching credentials."""
+    if pid is None:
+        return None, None
+    configured = getattr(socket, "LOCAL_PEERTOKEN", None)
+    options = (
+        [configured]
+        if isinstance(configured, int) and not isinstance(configured, bool)
+        else []
+    )
+    options.extend(DARWIN_PEER_TOKEN_FALLBACKS)
+    seen: set[int] = set()
+    for option in options:
+        if option in seen:
+            continue
+        seen.add(option)
+        try:
+            raw = _sockopt_bytes(conn, option, 32)
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if raw is None or len(raw) != 32:
+            continue
+        audit_uid, audit_pid = _audit_identity(raw)
+        if audit_uid == uid and audit_pid == pid:
+            return audit_uid, audit_pid
+    return None, None
+
+
 def _cf_string(cf: ctypes.CDLL, value: int | None) -> str | None:
     """Convert a CoreFoundation string pointer without dereferencing NULL."""
     if not value:
@@ -529,13 +560,11 @@ def peer_identity(conn: socket.socket) -> PeerIdentity:
     if pid is not None and pid <= 0:
         raise PeerAuthenticationError("kernel returned an invalid peer pid")
 
-    # Python 3.11 and 3.14 omit this Darwin constant. The value is
-    # LOCAL_PEERTOKEN 0x006 in Apple's sys/un.h (MacOSX15 and MacOSX26 SDKs).
-    token_option = getattr(socket, "LOCAL_PEERTOKEN", 0x006)
-    raw_token = _sockopt_bytes(conn, token_option, 32)
-    audit_uid, audit_pid = _audit_identity(raw_token or b"")
-    if raw_token and (audit_uid is None or audit_pid is None):
-        raise PeerAuthenticationError("peer audit token could not be verified")
+    # Python versions may omit LOCAL_PEERTOKEN. Probe the installed constant,
+    # then known Darwin values, and accept only a full audit token that agrees
+    # with both kernel credential sources. This tolerates SDK-number drift
+    # without treating a UUID option as an audit token.
+    audit_uid, audit_pid = _peer_audit_identity(conn, uid, pid)
     if audit_uid is not None and audit_uid != uid:
         raise PeerAuthenticationError("peer credential and audit token disagree")
     if audit_pid is not None and pid is not None and audit_pid != pid:
@@ -543,7 +572,7 @@ def peer_identity(conn: socket.socket) -> PeerIdentity:
     if sys.platform == "darwin" and (
         pid is None or audit_uid is None or audit_pid is None
     ):
-        raise PeerAuthenticationError("macOS did not provide a complete peer identity")
+        raise PeerAuthenticationError("macOS did not provide a matching peer audit token")
     # Resolving a code signature is comparatively expensive. The kernel audit
     # token and HMAC are always checked; ask Security.framework only when the
     # caller enabled a team policy that can use the result.
