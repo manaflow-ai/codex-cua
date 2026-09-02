@@ -977,7 +977,10 @@ def _resolve_endpoint_paths(document: dict, root: Path) -> tuple[int, Path, Path
 
 
 def _read_session_token(auth_path: Path) -> bytes:
-    token_text = _read_private(auth_path, limit=128).decode("ascii", "strict").strip()
+    try:
+        token_text = _read_private(auth_path, limit=128).decode("ascii", "strict").strip()
+    except UnicodeDecodeError as exc:
+        raise IPCError("session authentication token is not ASCII") from exc
     if not re.fullmatch(r"[0-9a-fA-F]{64}", token_text):
         raise IPCError("session authentication token is invalid")
     try:
