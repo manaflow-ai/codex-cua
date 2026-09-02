@@ -85,13 +85,25 @@ class SessionSecurityTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.TemporaryDirectory()
         self.previous_home = os.environ.get("CODEX_CUA_HOME")
+        self.previous_allowed_team_ids = os.environ.get("CODEX_CUA_ALLOWED_TEAM_IDS")
+        self.previous_require_team_id = os.environ.get("CODEX_CUA_REQUIRE_TEAM_ID")
         os.environ["CODEX_CUA_HOME"] = self.home.name
+        os.environ.pop("CODEX_CUA_ALLOWED_TEAM_IDS", None)
+        os.environ.pop("CODEX_CUA_REQUIRE_TEAM_ID", None)
 
     def tearDown(self):
         if self.previous_home is None:
             os.environ.pop("CODEX_CUA_HOME", None)
         else:
             os.environ["CODEX_CUA_HOME"] = self.previous_home
+        if self.previous_allowed_team_ids is None:
+            os.environ.pop("CODEX_CUA_ALLOWED_TEAM_IDS", None)
+        else:
+            os.environ["CODEX_CUA_ALLOWED_TEAM_IDS"] = self.previous_allowed_team_ids
+        if self.previous_require_team_id is None:
+            os.environ.pop("CODEX_CUA_REQUIRE_TEAM_ID", None)
+        else:
+            os.environ["CODEX_CUA_REQUIRE_TEAM_ID"] = self.previous_require_team_id
         self.home.cleanup()
 
     def test_session_uses_random_private_endpoint_and_metadata(self):
