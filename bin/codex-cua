@@ -1053,7 +1053,7 @@ def _create_session() -> tuple[SessionInfo, socket.socket]:
         _unlink_best_effort(auth_path)
         try:
             session_dir.rmdir()
-        except OSError:
+        except (OSError, IPCError):
             pass
         raise
 
@@ -1217,7 +1217,7 @@ def _handle_daemon_connection(
         try:
             conn.settimeout(IPC_AUTH_TIMEOUT)
             _send_frame(conn, {"ok": False, "error": "unauthorized"})
-        except OSError:
+        except (OSError, IPCError):
             pass
     except Exception as exc:  # noqa: BLE001 - report every failure to the client
         message = str(exc) if isinstance(exc, (RuntimeError, SystemExit)) else f"{type(exc).__name__}: {exc}"
