@@ -244,7 +244,7 @@ def _secure_state_dir(path: Path) -> Path:
         if path != _default_state_dir():
             raise IPCError(f"state directory must be mode 0700: {path}")
         try:
-            os.chmod(path, PRIVATE_DIR_MODE)
+            os.chmod(path, PRIVATE_DIR_MODE, follow_symlinks=False)
         except OSError as exc:
             raise IPCError(f"cannot secure state directory {path}: {exc}") from exc
         info = _private_stat(path, directory=True)
@@ -1024,7 +1024,7 @@ def _create_session() -> tuple[SessionInfo, socket.socket]:
         break
     if session_dir is None:
         raise IPCError("could not allocate a random session directory")
-    os.chmod(session_dir, PRIVATE_DIR_MODE)
+    os.chmod(session_dir, PRIVATE_DIR_MODE, follow_symlinks=False)
     auth_path = session_dir / "auth.token"
     socket_path = session_dir / "session.sock"
     endpoint = endpoint_path()
