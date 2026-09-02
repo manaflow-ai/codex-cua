@@ -11,6 +11,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -560,6 +561,70 @@ class SessionSecurityTest(unittest.TestCase):
         finally:
             left.close()
             right.close()
+
+    def test_shutdown_ack_waits_until_start_lock_is_released(self):
+        session, listener = cua._create_session()
+        lock_fd = cua._open_lock()
+        left, right = socket.socketpair()
+        events = []
+
+        class ExitRequested(Exception):
+            pass
+
+        class FakeServer:
+            def stop(self):
+                events.append("stop")
+
+        def fake_cleanup(_session, _listener):
+            events.append("cleanup")
+
+        def fake_send(_conn, value, **_kwargs):
+            self.assertEqual(value, {"ok": True})
+            events.append("reply")
+            probe_fd = cua._open_lock()
+            os.close(probe_fd)
+            events.append("lock-free")
+
+        try:
+            with (
+                mock.patch.object(cua, "_cleanup_session", side_effect=fake_cleanup),
+                mock.patch.object(cua, "_send_frame", side_effect=fake_send),
+                mock.patch.object(cua.os, "_exit", side_effect=ExitRequested),
+                self.assertRaises(ExitRequested),
+            ):
+                cua._shutdown_daemon(session, listener, FakeServer(), lock_fd, left)
+            lock_fd = -1
+            self.assertEqual(events, ["cleanup", "stop", "reply", "lock-free"])
+        finally:
+            if lock_fd >= 0:
+                os.close(lock_fd)
+            left.close()
+            right.close()
+            cua._cleanup_session(session, listener)
+
+    def test_reaper_removes_only_old_unreferenced_sessions(self):
+        first, first_listener = cua._create_session()
+        second, second_listener = cua._create_session()
+        first_listener.close()
+        try:
+            self.assertEqual(cua._reap_stale_sessions(Path(self.home.name)), 0)
+            self.assertTrue(first.session_dir.exists())
+            old = time.time() - cua.STALE_SESSION_AGE - 1
+            os.utime(first.session_dir, (old, old), follow_symlinks=False)
+            self.assertEqual(cua._reap_stale_sessions(Path(self.home.name)), 1)
+            self.assertFalse(first.session_dir.exists())
+            self.assertTrue(second.session_dir.exists())
+        finally:
+            cua._cleanup_session(second, second_listener)
+
+    def test_reaper_skips_old_session_directories_with_unknown_files(self):
+        candidate = Path(self.home.name) / ".s-aaaaaaaaaaaa"
+        candidate.mkdir(mode=0o700)
+        (candidate / "unexpected").write_text("keep")
+        old = time.time() - cua.STALE_SESSION_AGE - 1
+        os.utime(candidate, (old, old), follow_symlinks=False)
+        self.assertEqual(cua._reap_stale_sessions(Path(self.home.name)), 0)
+        self.assertTrue(candidate.exists())
 
 
 if __name__ == "__main__":
