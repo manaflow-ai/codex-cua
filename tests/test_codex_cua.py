@@ -7,10 +7,12 @@ import json
 import os
 import socket
 import stat
+import struct
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SPEC = importlib.util.spec_from_loader(
@@ -515,6 +517,46 @@ class SessionSecurityTest(unittest.TestCase):
             identity = cua.peer_identity(left)
             self.assertEqual(identity.audit_pid, os.getpid())
             self.assertEqual(identity.audit_uid, os.getuid())
+        finally:
+            left.close()
+            right.close()
+
+    def test_peer_identity_probes_fallback_audit_token_options(self):
+        if sys.platform != "darwin":
+            self.skipTest("Darwin local-socket options are not available")
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        uid = os.getuid()
+        pid = os.getpid()
+        peercred_option = getattr(socket, "LOCAL_PEERCRED", 1)
+        peerpid_option = getattr(socket, "LOCAL_PEERPID", 2)
+        calls = []
+        raw_cred = b"\x00\x00\x00\x00" + struct.pack("=I", uid)
+
+        def fake_sockopt(_conn, option, _size):
+            calls.append(option)
+            if option == peercred_option:
+                return raw_cred
+            if option == peerpid_option:
+                return struct.pack("=i", pid)
+            if option in {0x007, 0x006}:
+                return b"short"
+            if option == 0x005:
+                return b"audit-token".ljust(32, b"\0")
+            return None
+
+        def fake_audit(raw):
+            return (uid, pid) if raw.startswith(b"audit-token") else (None, None)
+
+        try:
+            with (
+                mock.patch.object(socket, "LOCAL_PEERTOKEN", 0x007, create=True),
+                mock.patch.object(cua, "_sockopt_bytes", side_effect=fake_sockopt),
+                mock.patch.object(cua, "_audit_identity", side_effect=fake_audit),
+            ):
+                identity = cua.peer_identity(left)
+            self.assertEqual(identity.audit_uid, uid)
+            self.assertEqual(identity.audit_pid, pid)
+            self.assertEqual(calls[2:], [0x007, 0x006, 0x005])
         finally:
             left.close()
             right.close()
