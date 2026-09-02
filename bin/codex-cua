@@ -53,6 +53,9 @@ PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 OPENAI_TEAM_ID = "2DC432GLL2"
 DARWIN_PEER_TOKEN_FALLBACKS = (0x006, 0x005)
+STALE_SESSION_AGE = 24 * 60 * 60
+STALE_SESSION_SCAN_LIMIT = 128
+SESSION_DIR_NAME_RE = re.compile(r"\.s-[0-9a-f]{12}\Z")
 
 TOOLS = {
     "list_apps": (),
@@ -1048,6 +1051,205 @@ def _load_session() -> SessionInfo:
     return SessionInfo(endpoint, session_dir, socket_path, auth_path, pid, token)
 
 
+def _endpoint_session_dir(root: Path) -> Path | None:
+    """Return the session directory referenced by the endpoint, if safe."""
+    try:
+        document = _read_endpoint(root / ENDPOINT_PATH.name)
+        _, socket_value, auth_value = _endpoint_fields(document)
+        if not Path(socket_value).is_absolute() or not Path(auth_value).is_absolute():
+            return None
+        socket_path = Path(os.path.realpath(socket_value))
+        auth_path = Path(os.path.realpath(auth_value))
+        root = Path(os.path.realpath(root))
+        session_dir = socket_path.parent
+        if (
+            session_dir != auth_path.parent
+            or socket_path.name != "session.sock"
+            or auth_path.name != "auth.token"
+            or not SESSION_DIR_NAME_RE.fullmatch(session_dir.name)
+        ):
+            return None
+        session_dir.relative_to(root)
+        return session_dir
+    except (FileNotFoundError, IPCError, OSError, ValueError):
+        return None
+
+
+def _socket_is_live(path: Path) -> bool:
+    """Treat any socket response except an explicit refusal as live/unknown."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not stat.S_ISSOCK(info.st_mode):
+        return True
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(0.2)
+            conn.connect(str(path))
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _private_directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _session_dir_matches(fd: int, expected: os.stat_result) -> bool:
+    try:
+        actual = os.fstat(fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(actual.st_mode)
+        and actual.st_uid == os.getuid()
+        and stat.S_IMODE(actual.st_mode) == PRIVATE_DIR_MODE
+        and (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+    )
+
+
+def _session_child_is_safe(fd: int, child: str, socket_path: Path) -> bool:
+    try:
+        info = os.stat(child, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return False
+    expected_type = stat.S_ISSOCK if child == "session.sock" else stat.S_ISREG
+    if not (
+        expected_type(info.st_mode)
+        and info.st_uid == os.getuid()
+        and info.st_nlink == 1
+        and stat.S_IMODE(info.st_mode) == PRIVATE_FILE_MODE
+    ):
+        return False
+    return child != "session.sock" or not _socket_is_live(socket_path)
+
+
+def _reap_session_dir(root_fd: int, root: Path, name: str, expected: os.stat_result) -> bool:
+    """Remove one old session directory without following attacker paths."""
+    try:
+        session_fd = os.open(name, _private_directory_flags(), dir_fd=root_fd)
+    except OSError:
+        return False
+    try:
+        if not _session_dir_matches(session_fd, expected):
+            return False
+        try:
+            children = os.listdir(session_fd)
+        except OSError:
+            return False
+        if any(child not in {"session.sock", "auth.token"} for child in children):
+            return False
+        socket_path = root / name / "session.sock"
+        for child in children:
+            if not _session_child_is_safe(session_fd, child, socket_path):
+                return False
+            try:
+                os.unlink(child, dir_fd=session_fd)
+            except OSError:
+                return False
+        try:
+            os.rmdir(name, dir_fd=root_fd)
+        except OSError:
+            return False
+        return True
+    finally:
+        os.close(session_fd)
+
+
+def _private_root(fd: int) -> bool:
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) == PRIVATE_DIR_MODE
+    )
+
+
+def _stale_session_info(
+    root_fd: int, name: str, protected_name: str | None, now: float
+) -> os.stat_result | None:
+    if name == protected_name or not SESSION_DIR_NAME_RE.fullmatch(name):
+        return None
+    try:
+        info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != PRIVATE_DIR_MODE
+        or now - info.st_mtime < STALE_SESSION_AGE
+    ):
+        return None
+    return info
+
+
+def _reaper_paths(root: Path, protected: Path | None) -> tuple[Path, str | None] | None:
+    try:
+        root = Path(os.path.abspath(root))
+        if protected is None:
+            protected = _endpoint_session_dir(root)
+        else:
+            protected = Path(os.path.realpath(protected))
+        root_real = Path(os.path.realpath(root))
+        protected_name = (
+            protected.name
+            if protected is not None and protected.parent == root_real
+            else None
+        )
+        return root, protected_name
+    except (OSError, ValueError):
+        return None
+
+
+def _scan_stale_sessions(root_fd: int, root: Path, protected_name: str | None) -> int:
+    removed = 0
+    now = time.time()
+    scanned = 0
+    for name in os.listdir(root_fd):
+        if not SESSION_DIR_NAME_RE.fullmatch(name):
+            continue
+        if scanned >= STALE_SESSION_SCAN_LIMIT:
+            break
+        scanned += 1
+        info = _stale_session_info(root_fd, name, protected_name, now)
+        if info is not None and _reap_session_dir(root_fd, root, name, info):
+            removed += 1
+    return removed
+
+
+def _reap_stale_sessions(root: Path, *, protected: Path | None = None) -> int:
+    """Reclaim bounded-age, unreferenced session remnants conservatively."""
+    prepared = _reaper_paths(root, protected)
+    if prepared is None:
+        return 0
+    root, protected_name = prepared
+    root_fd = -1
+    try:
+        root_fd = os.open(root, _private_directory_flags())
+        if not _private_root(root_fd):
+            return 0
+        return _scan_stale_sessions(root_fd, root, protected_name)
+    except (OSError, ValueError):
+        return 0
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
 def _create_session() -> tuple[SessionInfo, socket.socket]:
     root = state_dir()
     session_dir = None
@@ -1084,7 +1286,9 @@ def _create_session() -> tuple[SessionInfo, socket.socket]:
         }
         _write_private(endpoint, _canonical_json(document) + b"\n", replace=True)
         _write_private(pid_path(), f"{os.getpid()}\n".encode(), replace=True)
-        return SessionInfo(endpoint, session_dir, socket_path, auth_path, os.getpid(), token), listener
+        session = SessionInfo(endpoint, session_dir, socket_path, auth_path, os.getpid(), token)
+        _reap_stale_sessions(root, protected=session_dir)
+        return session, listener
     except Exception:
         if listener is not None:
             listener.close()
@@ -1123,6 +1327,41 @@ def _cleanup_session(session: SessionInfo, listener: socket.socket | None = None
         session.session_dir.rmdir()
     except OSError:
         pass
+
+
+def _shutdown_daemon(
+    session: SessionInfo,
+    listener: socket.socket | None,
+    server: AppServer,
+    lock_fd: int,
+    reply_conn: socket.socket | None = None,
+) -> None:
+    """Finish shutdown before acknowledging a restart or stop request."""
+    cleanup_error: Exception | None = None
+    try:
+        _cleanup_session(session, listener)
+    except Exception as exc:  # noqa: BLE001 - shutdown must release the lock
+        cleanup_error = exc
+    try:
+        server.stop()
+    except Exception as exc:  # noqa: BLE001 - shutdown must release the lock
+        if cleanup_error is None:
+            cleanup_error = exc
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+
+    if reply_conn is not None:
+        try:
+            reply_conn.settimeout(IPC_AUTH_TIMEOUT)
+            reply = {"ok": cleanup_error is None}
+            if cleanup_error is not None:
+                reply["error"] = "daemon cleanup failed"
+            _send_frame(reply_conn, reply)
+        except (OSError, IPCError):
+            pass
+    os._exit(0)
 
 
 def _server_handshake(conn: socket.socket, session: SessionInfo) -> dict:
@@ -1242,8 +1481,6 @@ def _handle_daemon_connection(
         if payload.get("op") == "ping":
             reply = {"ok": True, "thread": server.thread_id, "pid": os.getpid()}
         elif payload.get("op") == "shutdown":
-            conn.settimeout(IPC_AUTH_TIMEOUT)
-            _send_frame(conn, {"ok": True})
             return True
         else:
             reply = {"ok": True, "result": execute(server, primed, payload)}
@@ -1279,10 +1516,7 @@ def run_daemon(verbose: bool) -> None:
         primed: set[str] = set()
 
         def shutdown(*_args):
-            _cleanup_session(session, listener)
-            server.stop()
-            os.close(lock_fd)
-            os._exit(0)
+            _shutdown_daemon(session, listener, server, lock_fd)
 
         signal.signal(signal.SIGTERM, shutdown)
         signal.signal(signal.SIGINT, shutdown)
@@ -1290,7 +1524,7 @@ def run_daemon(verbose: bool) -> None:
             conn, _ = listener.accept()
             with conn:
                 if _handle_daemon_connection(conn, session, server, primed):
-                    shutdown()
+                    _shutdown_daemon(session, listener, server, lock_fd, conn)
                     return
     finally:
         if session is not None:
