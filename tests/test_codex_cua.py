@@ -418,6 +418,15 @@ class SessionSecurityTest(unittest.TestCase):
         finally:
             endpoint.unlink(missing_ok=True)
 
+    def test_daemon_alive_treats_non_ascii_auth_as_dead(self):
+        session, listener = cua._create_session()
+        try:
+            session.auth_path.write_bytes(b"\xff\n")
+            self.assertFalse(cua.daemon_alive())
+        finally:
+            session.auth_path.write_bytes(session.token.hex().encode("ascii") + b"\n")
+            cua._cleanup_session(session, listener)
+
     def test_endpoint_symlink_and_unsafe_directory_are_rejected(self):
         session, listener = cua._create_session()
         try:
