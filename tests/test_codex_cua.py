@@ -399,6 +399,25 @@ class SessionSecurityTest(unittest.TestCase):
         finally:
             endpoint.unlink(missing_ok=True)
 
+    def test_daemon_alive_treats_nul_endpoint_as_dead(self):
+        endpoint = cua.endpoint_path()
+        document = {
+            "version": cua.IPC_VERSION,
+            "pid": 1,
+            "socket": f"{self.home.name}/.s-bad/session\x00.sock",
+            "auth": f"{self.home.name}/.s-bad/auth.token",
+        }
+        session_dir = Path(self.home.name) / ".s-bad"
+        session_dir.mkdir(mode=0o700)
+        auth_path = session_dir / "auth.token"
+        auth_path.write_text("0" * 64)
+        os.chmod(auth_path, 0o600)
+        cua._write_private(endpoint, (json.dumps(document) + "\n").encode())
+        try:
+            self.assertFalse(cua.daemon_alive())
+        finally:
+            endpoint.unlink(missing_ok=True)
+
     def test_endpoint_symlink_and_unsafe_directory_are_rejected(self):
         session, listener = cua._create_session()
         try:
